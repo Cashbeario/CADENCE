@@ -40,6 +40,8 @@ class Daemon:
         self.ideate = ideate
         self.archived = archived or set  # project ids the daemon must leave alone
         self.paused = False
+        self.user_turns = 0              # chat turns in flight: a live user directive outranks background work
+        self._force: set[str] = set()    # goals the user asked to plan right now
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._tasks: dict[str, asyncio.Task[Task]] = {}
@@ -89,6 +91,7 @@ class Daemon:
 
     def plan_now(self, goal: Goal) -> None:
         """Ask for a planning pass on the next tick, ignoring the cooldown."""
+        self._force.add(goal.id)
         if self.planner:
             self.planner.goals.update(goal, last_planned=0.0)
         self._wake.set()
@@ -134,9 +137,19 @@ class Daemon:
             return
         paused = {g.id for g in self.planner.goals.all() if g.status != "active"} if self.planner else set()
         archived = self.archived()
-        for task in [t for t in self.store.list("pending") if t.goal not in paused and t.project not in archived][:free]:
+        ready = [t for t in self.store.list("pending") if t.goal not in paused and t.project not in archived]
+        if self.user_turns:  # a user directive is being worked on: only user-set or urgent tasks may start beside it
+            ready = [t for t in ready if t.source == "user" or t.priority >= 5]
+        for task in sorted(ready, key=self._weight, reverse=True)[:free]:
             if task.id not in self._tasks:
                 self._tasks[task.id] = asyncio.create_task(self._run_task(task), name=f"task-{task.id}")
+
+    def _weight(self, task: Task) -> tuple[float, float]:
+        """Run order: task priority + its goal's priority + a boost for work the user asked for; older and overdue first."""
+        goal = self.planner.goals.get(task.goal) if self.planner and task.goal else None
+        score = task.priority + (goal.priority if goal else 0) + (3 if task.source == "user" else 0)
+        overdue = 1.0 if task.due and task.due < time.time() else 0.0
+        return (score + overdue, -task.created)
 
     async def _run_task(self, task: Task) -> Task:
         await self._say("task", f"▶ {task.title}")
@@ -150,16 +163,23 @@ class Daemon:
         return result
 
     def _advance_goals(self) -> None:
-        """Plan every active goal that has nothing queued (one planning call at a time: it is a big-model call)."""
+        """Evaluate goals (one planning call at a time: it is a big-model call), highest priority first. A goal is
+        planned when asked for, when nothing is queued for it, or when its review time has come round."""
         if not self.planner or self._planning:
             return
         now = time.time()
         archived = self.archived()
-        for goal in self.planner.goals.list("active"):
-            if goal.project in archived or self.planner.open_tasks(goal) or now - goal.last_planned < REPLAN_COOLDOWN:
+        for goal in sorted(self.planner.goals.list("active"), key=lambda g: (-g.priority, g.last_planned)):
+            if goal.project in archived:
                 continue
-            if goal.last_planned and self.planner.budget_left(goal) == 0:
+            forced = goal.id in self._force
+            due_review = bool(goal.last_planned) and now >= goal.next_review > 0
+            idle = not self.planner.open_tasks(goal) and now - goal.last_planned >= REPLAN_COOLDOWN
+            if not (forced or due_review or idle):
                 continue
+            if not forced and not due_review and goal.last_planned and self.planner.budget_left(goal) == 0:
+                continue
+            self._force.discard(goal.id)
             self._planning[goal.id] = asyncio.create_task(self._plan(goal), name=f"plan-{goal.id}")
             return
 
@@ -174,6 +194,8 @@ class Daemon:
                 await self._say("goal", f"? {goal.title}: {goal.question}")
             elif added:
                 await self._say("goal", f"◆ {goal.title} ({goal.progress}%): queued {', '.join(t.title for t in added)}")
+            await self.runner.hooks.emit("goal_planned", {"goal_id": goal.id, "title": goal.title, "progress": goal.progress,
+                                                          "assessment": goal.assessment, "queued": [t.title for t in added]})
         except Exception as exc:  # noqa: BLE001 — a planning bug must not stop the daemon
             log.exception("planning %s failed", goal.id)
             self.planner.goals.log(goal, "error", f"planning crashed: {exc}")
@@ -193,6 +215,7 @@ class Daemon:
         self._save_state()
         added = await self.ideate() if self.ideate else 0
         learned = await self.runner.consolidate_lessons()
+        await self.runner.hooks.emit("heartbeat", {"cycle": self.cycles_today, "ideas": added, "lessons": learned})
         await self._say("cycle", f"cycle {self.cycles_today}/{self.cfg.reflection_cycles}: {added} idea(s), {learned} lesson(s) consolidated")
         if added and self.cfg.auto_approve_ideas:
             self._wake.set()

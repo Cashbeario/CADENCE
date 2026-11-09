@@ -8,7 +8,10 @@ and plugins added from the UI reach agents that are already running.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -23,6 +26,7 @@ from .ideas import IdeaStore, ideate
 from .llm import ModelRouter
 from .mcp_host import McpHost
 from .memory import MemoryStore, build_memory
+from .reflect import reflect, transcript
 from .migrate import migrate_project
 from .plugins import PluginManager
 from .projects import Project, ProjectStore
@@ -33,6 +37,8 @@ from .tools import ToolRegistry, Workspace, builtin_tools
 
 Listener = Callable[[dict[str, Any]], Awaitable[None]]
 
+
+log = logging.getLogger(__name__)
 
 class ScopedConfig:
     """The global config seen from one project: `workspace` and `skill_dirs` differ, everything else is
@@ -110,13 +116,21 @@ class Runtime:
         self.planner = Planner(self.router, self.goals, self.tasks, self.memory, cfg)
         self.runner = TaskRunner(cfg, self.router, self.tasks, self.memory, self.new_agent, self.sandbox, self.hooks,
                                  sandbox_for=lambda pid: self.scope(pid).sandbox)
+        self.runner.on_finish = lambda agent, _task: self.reflect_agent(agent)
         self.daemon: Daemon | None = None
         self._idea_turn = 0
+        self._reflect_lock = asyncio.Lock()
         self.restart_required: set[str] = set()
 
     async def start(self) -> "Runtime":
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         self.skills.scan()
+        for d in self.canvas.all():  # drafts left open by a crash
+            if d.streaming:
+                self.canvas.update(d, streaming=False)
+        dropped = self.memory.dedupe()  # consolidation used to pile up near-identical lessons
+        if dropped:
+            log.info("memory: dropped %d near-duplicate memories", dropped)
         await self.mcp.start()
         self.plugins.load(self.registry, self.hooks, self.cfg, self.memory)  # last, so plugins may wrap anything
         return self
@@ -210,6 +224,24 @@ class Runtime:
         if added:
             await self.publish({"kind": "ideas", "project": p.id, "count": len(added)})
         return len(added)
+
+    async def reflect_agent(self, agent: Agent) -> None:
+        """Reflection pass over an agent's latest turn: files memories and ideas (see reflect.py). Never raises."""
+        if not self.cfg.reflect_after_turns:
+            return
+        try:
+            log_text = transcript(agent.ctx.messages)
+            async with self._reflect_lock:  # one at a time: it is a model call and the server may be busy
+                done = await reflect(self.router, self.memory, self.ideas, self.tasks, project=agent.project, log_text=log_text)
+            if done["memories"] or done["ideas"]:
+                bits = [f"{n} {w}" for w, n in (("memory" if done["memories"] == 1 else "memories", done["memories"]),
+                                                ("idea" if done["ideas"] == 1 else "ideas", done["ideas"])) if n]
+                await self.hooks.emit("reflection", {"agent": agent.name, "project": agent.project, **done})
+                await self.publish({"kind": "ideas", "project": agent.project, "count": done["ideas"]})
+                await self.publish({"kind": "memory", "project": agent.project})
+                await self.publish({"kind": "notice", "level": "info", "message": f"Reflection filed {' and '.join(bits)}", "at": time.time()})
+        except Exception:  # noqa: BLE001
+            log.exception("reflection failed")
 
     def make_daemon(self, notify: Notify | None = None, event_sink=None) -> Daemon:
         self.daemon = Daemon(self.cfg, self.runner, self.tasks, notify, event_sink, planner=self.planner,

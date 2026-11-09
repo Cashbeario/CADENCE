@@ -29,9 +29,10 @@ class ModelConfig:
     base_url: str = "http://localhost:1234/v1"
     api_key: str = "lm-studio"
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     context_window: int = 32768
-    timeout: float = 180.0
+    reasoning_headroom: int = 6000  # extra tokens granted to short structured calls (planner, ideas, reflection) so a thinking model can finish reasoning and still answer
+    timeout: float = 900.0  # seconds to wait on the server (a big context can take minutes to prefill)
 
 
 @dataclass
@@ -113,8 +114,10 @@ class Config:
     reflection_cycles: int = 6      # autonomous idea/reflection cycles per day
     max_reflections_per_goal: int = 3
     allow_shell: bool = True
+    reflect_after_turns: bool = True  # after each chat turn / finished task, a reflection pass files memories, ideas and goal proposals
     auto_approve_ideas: bool = False  # autonomously generated goals wait for `goals approve` unless true
     max_parallel_goals: int = 2
+    goal_review_minutes: float = 60.0  # how often the planner re-evaluates each active goal, even while its tasks are queued
     goal_daily_tasks: int = 6       # tasks the planner may start per long-horizon goal per day
     vision: ModelConfig | None = None  # image understanding; None = use the big model
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -174,7 +177,7 @@ def expand_env(value: Any) -> Any:
 SCALARS = {
     "max_iterations", "tool_timeout", "compact_trigger", "compact_target", "keep_recent_messages",
     "tool_output_limit", "reflection_cycles", "max_reflections_per_goal", "allow_shell",
-    "auto_approve_ideas", "max_parallel_goals", "goal_daily_tasks",
+    "auto_approve_ideas", "max_parallel_goals", "goal_daily_tasks", "goal_review_minutes", "reflect_after_turns",
 }
 
 

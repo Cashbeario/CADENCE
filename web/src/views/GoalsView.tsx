@@ -80,7 +80,7 @@ function GoalRow({ g, active, onClick }: { g: Goal; active: boolean; onClick: ()
           : running || g.planning ? <Loader2 size={14} className="shrink-0 animate-spin text-brand" />
           : <Target size={14} className={clsx("shrink-0", g.status === "active" ? "text-brand" : "text-faint")} />}
         <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium">{g.title}</span>
-        <span className="font-mono text-[11px] text-faint">{g.progress}%</span>
+        <span className="font-mono text-[11px] text-faint">P{g.priority} · {g.progress}%</span>
       </div>
       <Progress value={g.progress} className="mt-2" />
       <div className="mt-1.5 truncate text-[11.5px] text-faint">
@@ -148,7 +148,26 @@ function GoalDetail({ g, reload, onEdit, daemon }: { g: Goal; reload: () => void
         </div>
         {g.assessment && <p className="mt-3 text-[13.5px] leading-relaxed">{g.assessment}</p>}
         {!g.assessment && <p className="mt-3 text-[13px] text-faint">No assessment yet. The planner writes one each time it reviews the goal.</p>}
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-faint">
+          <label className="flex items-center gap-1.5">Priority
+            <select className="rounded border border-line bg-transparent px-1 py-0.5 text-ink" value={g.priority}
+              onChange={(e) => set({ priority: Number(e.target.value) }, "Priority updated")}>
+              {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}{n === 5 ? " urgent" : n === 1 ? " low" : ""}</option>)}
+            </select>
+          </label>
+          <span>{g.last_planned ? `last evaluated ${ago(g.last_planned)}` : "not evaluated yet"}</span>
+          {g.status === "active" && g.next_review > 0 && <span>next evaluation {g.next_review * 1000 < Date.now() ? "due now" : `in ${Math.max(1, Math.round((g.next_review * 1000 - Date.now()) / 60000))} min`}</span>}
+        </div>
       </div>
+
+      {g.status === "active" && (
+        <div className="rounded-xl border border-brand/30 bg-brand/5 p-4">
+          <div className="label">Next task</div>
+          {g.next_task ? <NextTask t={g.next_task} /> : (
+            <p className="text-[13px] text-muted">{g.planning ? "Planning…" : "Nothing queued. The planner will line one up on its next pass, or press “Plan next steps”."}</p>
+          )}
+        </div>
+      )}
 
       {g.question && (
         <div className="rounded-xl border border-warn/40 bg-warn/10 p-4">
@@ -175,7 +194,8 @@ function GoalDetail({ g, reload, onEdit, daemon }: { g: Goal; reload: () => void
                 return (
                   <li key={t.id} className="flex items-start gap-2">
                     <Icon size={14} className={clsx("mt-0.5 shrink-0", t.status === "done" ? "text-ok" : t.status === "active" ? "animate-pulse text-brand" : ["failed", "blocked"].includes(t.status) ? "text-bad" : "text-faint")} />
-                    <span className={clsx(t.status === "done" && "text-muted")}>{t.title}</span>
+                    <span className={clsx(t.status === "done" && "text-muted")}>{t.title}
+                      <span className="ml-1.5 text-[11px] text-faint">P{t.priority}{t.finished && t.started ? ` · ${Math.max(1, Math.round((t.finished - t.started) / 60))} min` : t.estimate_min ? ` · ≈${t.estimate_min} min` : ""}</span></span>
                   </li>
                 );
               })}
@@ -200,6 +220,19 @@ function GoalDetail({ g, reload, onEdit, daemon }: { g: Goal; reload: () => void
           {[...g.journal].reverse().map((e, i) => <JournalItem key={i} e={e} />)}
         </ol>
       </section>
+    </div>
+  );
+}
+
+function NextTask({ t }: { t: Goal["tasks"][number] }) {
+  const overdue = t.due > 0 && t.due * 1000 < Date.now() && t.status !== "done";
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      <span className="text-[14px] font-medium">{t.title}</span>
+      <span className="rounded-full border border-line px-2 py-0.5 text-[11px] text-muted">P{t.priority}</span>
+      <span className="text-[12px] text-faint">{t.status === "active" ? `running since ${ago(t.started)}` : "queued"}</span>
+      {t.estimate_min > 0 && <span className="text-[12px] text-faint">≈{t.estimate_min} min</span>}
+      {t.due > 0 && <span className={clsx("text-[12px]", overdue ? "text-warn" : "text-faint")}>{overdue ? "overdue since" : "due"} {new Date(t.due * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>}
     </div>
   );
 }
@@ -229,15 +262,17 @@ function GoalForm({ open, goal, onClose, onSaved }: { open: boolean; goal: Goal 
   const [description, setDescription] = useState("");
   const [success, setSuccess] = useState("");
   const [start, setStart] = useState(true);
+  const [priority, setPriority] = useState(3);
   useEffect(() => {
     if (!open) return;
     setTitle(goal?.title ?? "");
     setDescription(goal?.description ?? "");
     setSuccess(goal?.success.join("\n") ?? "");
     setStart(true);
+    setPriority(goal?.priority ?? 3);
   }, [open, goal]);
   const save = async () => {
-    const body = { title, description, success: success.split("\n").map((x) => x.trim()).filter(Boolean) };
+    const body = { title, description, priority, success: success.split("\n").map((x) => x.trim()).filter(Boolean) };
     const g = await act(() => (goal ? api.editGoal(goal.id, body) : api.addGoal({ ...body, project, paused: !start })), goal ? "Goal saved" : "Goal set");
     if (g) {
       onSaved(g);
@@ -255,6 +290,11 @@ function GoalForm({ open, goal, onClose, onSaved }: { open: boolean; goal: Goal 
       <Field label="Success criteria" hint="One per line, concrete and checkable. The goal is only achieved when all are met.">
         <textarea className="input min-h-[90px] font-mono text-[12.5px]" value={success} onChange={(e) => setSuccess(e.target.value)}
           placeholder={"POST /v1/invoices creates an invoice\nStripe webhook marks invoices paid\nAPI docs in docs/api.md\npytest passes with >80% coverage on billing/"} />
+      </Field>
+      <Field label="Priority" hint="1 = whenever, 5 = urgent. Higher-priority goals are planned and run first, and always yield to what you ask in chat.">
+        <select className="input w-40" value={priority} onChange={(e) => setPriority(Number(e.target.value))}>
+          {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}</option>)}
+        </select>
       </Field>
       {!goal && (
         <label className="flex items-center gap-2 text-[13px] text-muted">

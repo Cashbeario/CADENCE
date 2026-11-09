@@ -3,6 +3,7 @@ import { Brain, Plus, Search } from "lucide-react";
 import { useEffect, useState } from "react";
 import { act, ConfirmButton, Empty, KindChip, PageHeader, ago } from "../components/ui";
 import { api, type MemoryItem, type Status } from "../lib/api";
+import { useStore } from "../lib/store";
 
 const KINDS = ["", "semantic", "procedural", "episodic"] as const;
 const KIND_HELP: Record<string, string> = {
@@ -12,6 +13,9 @@ const KIND_HELP: Record<string, string> = {
 };
 
 export function MemoryView() {
+  const { project, projects, liveTick } = useStore();
+  const [allProjects, setAllProjects] = useState(false);
+  const [shared, setShared] = useState(false); // new memory: shared by every project, or just this one
   const [q, setQ] = useState("");
   const [kind, setKind] = useState<(typeof KINDS)[number]>("");
   const [items, setItems] = useState<MemoryItem[]>([]);
@@ -25,7 +29,7 @@ export function MemoryView() {
   const run = async (query = q) => {
     setLoading(true);
     try {
-      const r = await api.memory(query, kind || undefined);
+      const r = await api.memory(query, kind || undefined, allProjects ? undefined : project);
       setItems(r.items);
       setStats(r.stats as Status["memory"]);
       setFallback(r.fallback);
@@ -37,7 +41,7 @@ export function MemoryView() {
   useEffect(() => {
     const t = setTimeout(() => void run(), q ? 300 : 0);
     return () => clearTimeout(t);
-  }, [q, kind]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [q, kind, project, allProjects, liveTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="flex h-full flex-1 flex-col overflow-hidden">
@@ -53,7 +57,7 @@ export function MemoryView() {
               className="card space-y-3 p-4"
               onSubmit={async (e) => {
                 e.preventDefault();
-                await api.addMemory(newKind, newText);
+                await api.addMemory(newKind, newText, shared ? "" : project);
                 setNewText("");
                 setAdding(false);
                 void run();
@@ -69,7 +73,11 @@ export function MemoryView() {
                 <span className="ml-2 self-center text-xs text-faint">{KIND_HELP[newKind]}</span>
               </div>
               <textarea className="input min-h-[70px]" autoFocus placeholder="e.g. Deploys go through `make release`, never push to main directly" value={newText} onChange={(e) => setNewText(e.target.value)} />
-              <div className="flex justify-end gap-2">
+              <div className="flex items-center justify-end gap-2">
+                <label className="mr-auto flex items-center gap-2 text-xs text-muted">
+                  <input type="checkbox" checked={shared} onChange={(e) => setShared(e.target.checked)} className="accent-[rgb(var(--brand))]" />
+                  Share with every project
+                </label>
                 <button type="button" className="btn-ghost" onClick={() => setAdding(false)}>Cancel</button>
                 <button className="btn-primary" disabled={!newText.trim()}>Save</button>
               </div>
@@ -81,6 +89,10 @@ export function MemoryView() {
               <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint" />
               <input className="input pl-9" placeholder="Search by meaning — “how do we deploy?”" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
+            <button onClick={() => setAllProjects((a) => !a)} title="Memories belong to the project they were learned in; shared ones apply everywhere"
+              className={clsx("rounded-full border px-3 py-1 text-xs", allProjects ? "border-brand/50 bg-brand/10 text-brand" : "border-line text-muted hover:text-ink")}>
+              {allProjects ? "All projects" : "This project + shared"}
+            </button>
             <div className="flex gap-1.5">
               {KINDS.map((k) => (
                 <button key={k || "all"} onClick={() => setKind(k)}
@@ -106,6 +118,7 @@ export function MemoryView() {
                     <p className="whitespace-pre-wrap text-[13.5px] leading-relaxed">{m.text}</p>
                     <div className="mt-1 flex flex-wrap gap-2 text-[11px] text-faint">
                       <span>{ago(m.created)}</span>
+                      <span>{m.project ? projects.find((p) => p.id === m.project)?.name ?? "other project" : "shared"}</span>
                       {m.tags.map((t) => <span key={t}>#{t}</span>)}
                     </div>
                   </div>

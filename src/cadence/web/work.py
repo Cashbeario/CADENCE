@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -15,6 +16,13 @@ from ..tasks import OPEN, Task
 if TYPE_CHECKING:
     from ..runtime import Runtime
     from .server import Hub
+
+
+def _prio(v: Any, default: int = 3) -> int:
+    try:
+        return max(1, min(5, int(v)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _strs(value: Any, limit: int = 12) -> list[str]:
@@ -54,6 +62,23 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
     @r.get("/api/projects")
     async def projects(_req: web.Request) -> web.Response:
         return web.json_response([project_dict(p) for p in rt.projects.all()])
+
+    @r.get("/api/fs")
+    async def browse(req: web.Request) -> web.Response:
+        """Sub-directories of any folder on this machine, for the folder picker (names only, never file contents)."""
+        raw = req.query.get("path", "").strip() or "~"
+        d = Path(raw).expanduser()
+        if not d.is_absolute():
+            raise web.HTTPBadRequest(text="use an absolute path (or one starting with ~)")
+        d = d.resolve()
+        if not d.is_dir():
+            raise web.HTTPBadRequest(text=f"{d} is not a directory")
+        try:
+            kids = sorted((c for c in d.iterdir() if c.is_dir() and not c.name.startswith(".")), key=lambda c: c.name.lower())
+        except PermissionError:
+            raise web.HTTPForbidden(text="permission denied")
+        return web.json_response({"path": str(d), "parent": str(d.parent) if d != d.parent else None, "home": str(Path.home()),
+                                  "dirs": [{"name": c.name, "path": str(c)} for c in kids[:1000]]})
 
     @r.post("/api/projects/suggest-name")
     async def suggest(req: web.Request) -> web.Response:
@@ -127,7 +152,11 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
         d = asdict(g)
         d["project"] = norm(g.project)
         tasks = rt.tasks.list(goal=g.id)
-        d["tasks"] = [{"id": t.id, "title": t.title, "status": t.status, "updated": t.updated} for t in tasks]
+        d["tasks"] = [{"id": t.id, "title": t.title, "status": t.status, "updated": t.updated, "priority": t.priority,
+                       "due": t.due, "estimate_min": t.estimate_min, "started": t.started, "finished": t.finished} for t in tasks]
+        open_ = sorted((t for t in tasks if t.status in ("proposed", "pending", "active")),
+                       key=lambda t: (t.status != "active", -t.priority, t.created))
+        d["next_task"] = d["tasks"][tasks.index(open_[0])] if open_ else None
         d["planning"] = bool(rt.daemon and g.id in rt.daemon.planning)
         return d
 
@@ -144,7 +173,7 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
         if not title:
             raise web.HTTPBadRequest(text="title required")
         g = rt.goals.add(Goal(title=title[:160], description=str(data.get("description", "")), success=_strs(data.get("success")),
-                              project=rt.project(str(data.get("project", ""))).id,
+                              project=rt.project(str(data.get("project", ""))).id, priority=_prio(data.get("priority")),
                               status="paused" if data.get("paused") else "active"))
         rt.goals.log(g, "created", "goal set by the user")
         wake()
@@ -166,6 +195,8 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
             changes["status"] = data["status"]
             if data["status"] == "active":
                 changes["question"] = ""
+        if "priority" in data:
+            changes["priority"] = _prio(data["priority"], g.priority)
         if "progress" in data:
             changes["progress"] = max(0, min(100, int(data["progress"])))
         rt.goals.update(g, **changes)
@@ -183,6 +214,8 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
         action = req.match_info["action"]
         data = await body(req)
         if action == "plan":
+            if rt.project(g.project).archived:
+                raise web.HTTPConflict(text="this goal's project is archived: unarchive it and the daemon will plan it again")
             if g.status != "active":
                 rt.goals.update(g, status="active", question="")
             if rt.daemon:
@@ -242,7 +275,9 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
             raise web.HTTPBadRequest(text="title required")
         task = Task(title=title[:160], description=str(data.get("description", "") or title),
                     acceptance=_strs(data.get("acceptance")), verify_command=str(data.get("verify_command", "") or ""),
-                    project=rt.project(str(data.get("project", ""))).id, goal=str(data.get("goal", "")))
+                    project=rt.project(str(data.get("project", ""))).id, goal=str(data.get("goal", "")),
+                    priority=_prio(data.get("priority"), 4), estimate_min=int(data.get("estimate_min") or 0),  # typed by the user: outranks background work
+                    due=float(data.get("due") or 0))
         (rt.daemon.submit(task) if rt.daemon else rt.tasks.add(task))
         await changed("tasks", task.project)
         return web.json_response(task_dict(task))
@@ -258,6 +293,11 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
         changes: dict[str, Any] = {k: str(data[k]) for k in ("title", "description", "verify_command") if k in data}
         if "acceptance" in data:
             changes["acceptance"] = _strs(data["acceptance"])
+        if "priority" in data:
+            changes["priority"] = _prio(data["priority"], t.priority)
+        for k, cast in (("estimate_min", int), ("due", float)):
+            if k in data:
+                changes[k] = cast(data[k] or 0)
         rt.tasks.update(t, **changes)
         await changed("tasks", t.project)
         return web.json_response(task_dict(t))
@@ -333,6 +373,7 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
         i = rt.ideas.add(Idea(title=title[:160], description=str(data.get("description", "")),
                               size="goal" if data.get("size") == "goal" else "task", acceptance=_strs(data.get("acceptance")),
                               verify_command=str(data.get("verify_command", "") or ""), tags=_strs(data.get("tags")),
+                              priority=_prio(data.get("priority")),
                               project=rt.project(str(data.get("project", ""))).id))
         await changed("ideas", i.project)
         return web.json_response(idea_dict(i))
@@ -353,6 +394,8 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
             raise web.HTTPNotFound(text="no such idea")
         data = await body(req)
         changes: dict[str, Any] = {k: str(data[k]) for k in ("title", "description", "verify_command") if k in data}
+        if "priority" in data:
+            changes["priority"] = _prio(data["priority"], i.priority)
         if "size" in data:
             changes["size"] = "goal" if data["size"] == "goal" else "task"
         if "status" in data:
@@ -382,7 +425,7 @@ def routes(r: web.RouteTableDef, rt: "Runtime", hub: "Hub") -> None:
             raise web.HTTPConflict(text=f"already promoted to {i.promoted_to}")
         to = (await body(req)).get("to", i.size)
         if to == "goal":
-            g = rt.goals.add(Goal(title=i.title, description=i.description, success=list(i.acceptance), project=i.project))
+            g = rt.goals.add(Goal(title=i.title, description=i.description, success=list(i.acceptance), project=i.project, priority=i.priority))
             rt.goals.log(g, "created", f"promoted from idea {i.id}")
             rt.ideas.update(i, status="promoted", promoted_to=f"goal:{g.id}")
             result: dict[str, Any] = {"goal": goal_dict(g)}

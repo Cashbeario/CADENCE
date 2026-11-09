@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cadence: how it works behind the scenes</title>
+<style>
+  :root {
+    --bg: #fbf8f8; --panel: #ffffff; --ink: #1d1416; --muted: #6a5a5e; --line: #e6dcde;
+    --brand: #b3122a; --brand-soft: #f8e4e7; --ok: #1b7a46; --warn: #a15c00; --warn-soft: #fff1da;
+    --code: #f3ecee; --info: #1f5fa8; --info-soft: #e3eefb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #140d0f; --panel: #1d1416; --ink: #f1e8ea; --muted: #b3a2a6; --line: #36272b;
+      --brand: #ff5a6e; --brand-soft: #3a1620; --ok: #4cc585; --warn: #f0a640; --warn-soft: #3a2a10;
+      --code: #271b1e; --info: #6aa8f0; --info-soft: #14243a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px 80px; }
+  header { padding: 48px 0 24px; }
+  h1 { font-size: clamp(28px, 5vw, 40px); line-height: 1.15; margin: 0 0 8px; letter-spacing: -0.02em; }
+  h1 span { color: var(--brand); }
+  h2 { font-size: 24px; margin: 56px 0 12px; padding-top: 8px; letter-spacing: -0.01em; }
+  h3 { font-size: 17px; margin: 28px 0 6px; }
+  p { margin: 8px 0; }
+  .lede { color: var(--muted); font-size: 18px; max-width: 70ch; }
+  nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 0; }
+  nav a { font-size: 13px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); text-decoration: none; background: var(--panel); }
+  nav a:hover { color: var(--brand); border-color: var(--brand); }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font: 0.88em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin: 14px 0; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .grid .card { margin: 0; }
+  .card h3 { margin-top: 0; }
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 12px 0; }
+  ol.steps li { counter-increment: s; position: relative; padding: 10px 14px 10px 54px; margin: 8px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  ol.steps li::before { content: counter(s); position: absolute; left: 14px; top: 10px; width: 28px; height: 28px; border-radius: 50%; background: var(--brand); color: #fff; font-weight: 700; display: grid; place-items: center; font-size: 14px; }
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin: 14px 0; }
+  .flow .n { flex: 1 1 140px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 14px; }
+  .flow .n b { display: block; color: var(--brand); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+  .flow .arr { align-self: center; color: var(--muted); font-size: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; display: block; overflow-x: auto; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--brand-soft); font-size: 12.5px; text-transform: uppercase; letter-spacing: .04em; }
+  tr:last-child td { border-bottom: 0; }
+  .stack { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--panel); }
+  .stack div { padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 14.5px; }
+  .stack div:last-child { border-bottom: 0; }
+  .stack small { color: var(--muted); display: block; }
+  .stack .s1 { background: var(--brand-soft); } .stack .s2 { background: var(--info-soft); }
+  .tag { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); vertical-align: 1px; }
+  .tag.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .tag.warn { background: var(--warn-soft); color: var(--warn); }
+  .finding { border-left: 4px solid var(--warn); background: var(--warn-soft); border-radius: 0 10px 10px 0; padding: 12px 16px; margin: 12px 0; }
+  .finding.good { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, var(--panel)); }
+  .finding b { display: block; margin-bottom: 2px; }
+  .note { color: var(--muted); font-size: 14px; }
+  ul { padding-left: 20px; } li { margin: 3px 0; }
+  footer { margin-top: 56px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 16px; }
+  @media (max-width: 560px) { .flow .arr { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1><span>Cadence</span>: what happens behind the scenes</h1>
+  <p class="lede">A walk through the code as it stands today: what the model is actually sent, what the daemon does while you are away, where memories, ideas and goals come from, and what each extension point (skills, hooks, plugins, MCP) really does. The last section lists the problems I found while reading it.</p>
+  <nav>
+    <a href="#overview">Overview</a><a href="#request">A request, step by step</a><a href="#context">The context window</a>
+    <a href="#compaction">Compaction</a><a href="#memory">Memory</a><a href="#daemon">The daemon</a><a href="#ideas">Ideas, brainstorm, goals, tasks</a>
+    <a href="#extend">Skills, hooks, plugins, MCP</a><a href="#files">Files, uploads, projects</a><a href="#findings">Findings</a>
+  </nav>
+</header>
+
+<h2 id="overview">1. The big picture</h2>
+<p>One Python process (<code>cadence web</code>) holds everything. It serves the web app, keeps live chat sessions, and runs a <b>daemon</b> loop in the background. All state lives as plain files under <code>~/.cadence/state</code> (JSON and JSONL), plus a vector index in Qdrant for memory search. All model calls go to one OpenAI-compatible server (LM Studio here).</p>
+<div class="grid">
+  <div class="card"><h3>Two models, two jobs</h3>
+    <p><b>big</b> does the agent loop, planning, task reflection and brainstorming. <b>small</b> does housekeeping: compaction summaries, distilling tool output, lesson consolidation and the new post-turn reflection. Right now both point at <code>ornith-1.5-35b-a3b</code>, so "small" work competes with "big" work on the same server.</p></div>
+  <div class="card"><h3>Three ways work starts</h3>
+    <p>(1) You send a chat message. (2) You or an idea create a <b>task</b>, and the daemon runs it. (3) A <b>goal</b> exists and the planner queues tasks for it. Chat is interactive; tasks and goals are autonomous.</p></div>
+  <div class="card"><h3>Everything is project-scoped</h3>
+    <p>A <b>project</b> is a folder. Its file tools, shell, skills, instructions, canvas, browser, goals, tasks and ideas are tied to that folder. Memory is scoped too: each memory belongs to a project, or is marked shared.</p></div>
+</div>
+
+<h2 id="request">2. When you send a message</h2>
+<ol class="steps">
+  <li><b>Browser → server.</b> The web app sends <code>{op:"send", session, text, images, files}</code> over the WebSocket. If files were attached, they were already uploaded; they get copied into the project and their extracted text is appended to your message (see §9).</li>
+  <li><b>Session loaded.</b> The server finds the live session or reloads it from <code>~/.cadence/state/sessions/&lt;id&gt;.json</code>. If a turn is already running, your text becomes a <em>steer</em>: it is injected before the agent's next model call instead of starting a new turn.</li>
+  <li><b>Hooks: <code>session_start</code>, then <code>user_prompt</code>.</b> A hook can block the prompt, or print text that gets appended to your message as "[context from hooks]".</li>
+  <li><b>Memory recall.</b> Your message is embedded and searched against memory (top 5, vector and keyword blended). The hits are stored on the agent and placed in the system prompt. This happens <em>once per user message</em>, not on every loop iteration.</li>
+  <li><b>The loop starts</b> (max 40 iterations). Each iteration: apply any steering; rebuild the system prompt; compact if the window is too full; send everything to the big model and stream the reply.</li>
+  <li><b>Streaming to the UI.</b> Text tokens, "thinking" tokens and (new) the arguments of a <code>canvas_write</code> call are forwarded live, so a document appears in the canvas while it is being written.</li>
+  <li><b>Tool calls.</b> For each call: <code>pre_tool</code> hooks (can block), run the tool with a 120 s timeout, <code>post_tool</code> hooks (can append text). Read-only tools in the same batch run in parallel. The result is truncated to 8,000 characters and added to the conversation. An identical call repeated 3 times gets a warning appended.</li>
+  <li><b>Loop until no tool calls.</b> When the model answers with plain text, the <code>stop</code> hook fires, the session is saved, and the final message is sent to the UI.</li>
+  <li><b>After the turn (new).</b> A background reflection pass reads the turn and files memories and ideas (§5). It runs after the UI already has the answer.</li>
+</ol>
+
+<h2 id="context">3. What is in the context window</h2>
+<p>Every model call is: one big system message, then the conversation, plus the tool definitions. In order:</p>
+<div class="stack">
+  <div class="s1"><b>System prompt</b> <span class="note">rebuilt on every iteration, so edits to todos, scratchpad or memory show up immediately</span>
+    <small>1. Core instructions (how to work, verify, use tools)  ·  2. <code>SOUL.md</code> / <code>AGENTS.md</code> from the project, and a global <code>SOUL.md</code> (each cut at 6,000 chars)  ·  3. Project block: name, folder, description, your per-project instructions  ·  4. "Shared with the user": canvas and browser guidance  ·  5. Skill index: one line per skill (name and description only)  ·  6. Current todo list  ·  7. Scratchpad notes  ·  8. Relevant memory (the top 5 recalled hits)</small></div>
+  <div class="s1"><b>Rolling summary</b> <span class="note">only after compaction</span><small>Appended to the system message as "Conversation summary (earlier turns, compacted)".</small></div>
+  <div class="s2"><b>Conversation messages</b><small>Your messages (with attachment text and hook context), the agent's replies, every tool call and its result, steering notes. Images ride along on the user message for vision.</small></div>
+  <div class="s2"><b>Tool definitions</b> <span class="note">counted against the window</span><small>Built-ins (<code>read_file write_file edit_file list_files grep bash view_image</code>), agent tools (<code>todo_write scratchpad_set memory_add memory_search load_skill spawn_subagent</code>), skill tools, <code>canvas_*</code>, <code>browser_*</code>, plus any MCP and plugin tools.</small></div>
+</div>
+<p class="note">Token counts are estimates (about 3.6 characters per token), used to decide when to compact. The window size used is <code>big.context_window</code> from config, which defaults to <b>32,768</b> unless you set it (see findings).</p>
+
+<h2 id="compaction">4. Compaction</h2>
+<p>Before each model call, the loop checks whether usage is above <b>70%</b> of the window. If so it works down toward <b>40%</b> in three escalating stages, stopping as soon as it is low enough. The most recent 8 messages are never touched, and a tool call is never separated from its result.</p>
+<div class="flow">
+  <div class="n"><b>1 Shrink</b>No model. Old tool outputs over ~2,000 chars keep only their head and tail.</div><div class="arr">→</div>
+  <div class="n"><b>2 Distill</b>Small model condenses each very large old tool output (≥1,800 chars) to the facts that matter, marked <code>[distilled]</code>.</div><div class="arr">→</div>
+  <div class="n"><b>3 Fold</b>Small model merges the oldest messages, a few thousand tokens at a time, into the rolling summary (Goal, Decisions, Files touched, Commands, Errors, Open items).</div><div class="arr">→</div>
+  <div class="n"><b>Emergency</b>Above 92% after all that: the summary is cut and the oldest turns are simply dropped.</div>
+</div>
+<p>If the small model fails, a deterministic summary (user asks and tool names only) is used instead. The UI shows a note each time compaction runs.</p>
+
+<h2 id="memory">5. Memory: when is one created?</h2>
+<p>There are three kinds: <code>episodic</code> (what happened), <code>semantic</code> (facts), <code>procedural</code> (how-tos and rules). Exact-duplicate text is ignored. Memories are written to <code>memory.jsonl</code> and embedded into Qdrant lazily, the next time a search runs.</p>
+<table>
+  <tr><th>Trigger</th><th>What gets stored</th><th>Status</th></tr>
+  <tr><td>The agent calls <code>memory_add</code> itself</td><td>Whatever it chooses. The prompt only suggests it.</td><td><span class="tag warn">rare</span> your store was empty, so models rarely do this unprompted</td></tr>
+  <tr><td>Post-turn reflection (<code>reflect.py</code>)</td><td>Up to 4 memories per chat turn, tagged <code>reflection</code></td><td><span class="tag ok">new</span></td></tr>
+  <tr><td>A task finishes</td><td>One <em>episodic</em> line (title, status, attempts, result)</td><td><span class="tag ok">existing</span></td></tr>
+  <tr><td>A task is reflected on</td><td>Up to 4 <em>procedural</em> "lessons" per attempt</td><td><span class="tag ok">existing</span></td></tr>
+  <tr><td>Daemon improvement cycle</td><td>Up to 3 consolidated rules from recent critiques</td><td><span class="tag ok">existing</span></td></tr>
+  <tr><td>A goal is judged achieved</td><td>One episodic line</td><td><span class="tag ok">existing</span></td></tr>
+  <tr><td>You add one in the Memory page</td><td>As typed</td><td><span class="tag ok">existing</span></td></tr>
+</table>
+<p><b>When memories are read:</b> chat recall (top 5 on each user message), the agent's <code>memory_search</code> tool, the planner (last 6 procedural), and brainstorming (last 8 procedural). Ranking is a blend of vector similarity (floor 0.55) and keyword overlap, with a small recency bonus. If the embedding server is unreachable it silently falls back to keyword-only.</p>
+
+<h2 id="daemon">6. What the daemon is doing</h2>
+<p>The daemon is a loop that wakes every ≤30 seconds, or immediately when something calls <code>wake()</code> (a new task, a promoted idea, a goal change). It is <em>separate from your chat</em>; it never touches a chat session. Each pass:</p>
+<ol class="steps">
+  <li><b>Launch ready tasks.</b> Up to <code>max_parallel_goals</code> (2) pending tasks run concurrently, skipping tasks of paused goals or archived projects. Each gets its own fresh agent scoped to its project.</li>
+  <li><b>Plan goals.</b> Any <em>active</em> goal with no open tasks is planned (one planning call at a time). A goal that was just planned with nothing queued waits 10 minutes; a goal that has used its daily task budget (6) waits for tomorrow.</li>
+  <li><b>Heartbeat cycle.</b> Only when nothing else is running, and at most <code>reflection_cycles</code> (6) times a day, spaced 4 hours apart: one <b>idea cycle</b> (brainstorm for one project, rotating, projects with active goals first) and one <b>improvement cycle</b> (consolidate lessons into memory).</li>
+</ol>
+<p>On startup, tasks left "active" by a crash go back to the queue. A pause switch stops launching and planning.</p>
+
+<h3>How a task runs</h3>
+<div class="flow">
+  <div class="n"><b>Act</b>Agent runs with the task title, description, goal context and acceptance criteria.</div><div class="arr">→</div>
+  <div class="n"><b>Verify</b>If there is a <code>verify_command</code>, it runs in the project sandbox (5 min limit).</div><div class="arr">→</div>
+  <div class="n"><b>Reflect</b>Big model returns <code>done / retry / blocked</code> plus lessons. A passing or failing verify command overrules the model's opinion.</div><div class="arr">→</div>
+  <div class="n"><b>Outcome</b>done, or retry with the critique fed back (up to 3 reflections), or blocked/failed.</div>
+</div>
+<p>When a task ends, the <code>task_done</code> hook fires and, if it belonged to a goal, that goal is re-planned right away.</p>
+
+<h2 id="ideas">7. Ideas, brainstorm, goals and tasks</h2>
+<div class="grid">
+  <div class="card"><h3>Idea</h3><p>A cheap, unvetted inbox item. Nothing runs until you <b>promote</b> it, to a <em>task</em> (one verifiable change) or a <em>goal</em> (long-horizon). Sources: you, the daemon's idea cycle, and now post-turn reflection. Goal-sized ideas stay in the inbox until you promote them.</p></div>
+  <div class="card"><h3>Brainstorm button</h3><p>Calls the big model once with: a snapshot of the project's file tree (up to 80 files, 3 levels deep), the last 25 known idea/task/goal titles ("do not repeat"), and the last 8 procedural lessons. It asks for up to 3 ideas as JSON, drops near-duplicates (word overlap ≥ 0.6) and files them as ideas. The daemon's idea cycle uses the same function. With <code>auto_approve_ideas</code> on, task-sized ideas are promoted straight to tasks; yours is off.</p></div>
+  <div class="card"><h3>Goal</h3><p>A long-term objective with a vision, success criteria, a journal and a progress estimate. The <b>planner</b> (big model) reads the goal, its tasks so far, journal, lessons and project tree, then replies with an assessment, a progress number, a status (<code>working / achieved / needs_user</code>) and up to 2 new tasks. "Achieved" is only accepted when nothing is queued. <code>needs_user</code> pauses the goal with a question for you.</p></div>
+  <div class="card"><h3>Task</h3><p>One concrete unit with acceptance criteria and an optional shell check. Statuses: proposed, pending, active, done, failed, blocked. A task from a goal carries the goal's vision as context so the agent knows why it is working.</p></div>
+</div>
+<p><b>Why goals and ideas were empty:</b> the only automatic producer was the daemon's idea cycle, which runs at most every 4 hours, only when completely idle, and nothing creates goals except promotion. Chat itself never created any of them. The new reflection pass fixes the chat side; goal creation is still deliberately a human decision.</p>
+
+<h2 id="extend">8. Skills, hooks, plugins and MCP</h2>
+<table>
+  <tr><th>Piece</th><th>What it is</th><th>When it acts</th></tr>
+  <tr><td><b>Skills</b></td><td>Folders with a <code>SKILL.md</code> plus optional <code>references/</code>, <code>scripts/</code>, <code>assets/</code>. Loaded from <code>~/.cadence/skills</code> and the project's <code>.cadence/skills</code> and <code>.agents/skills</code>.</td>
+    <td>Only the name and description sit in the prompt. The agent calls <code>load_skill</code> to read the body, then <code>read_skill_file</code>, <code>run_skill_script</code> (in the sandbox) and <code>use_skill_asset</code> (copies into the project) as needed. Progressive disclosure keeps the window small.</td></tr>
+  <tr><td><b>Hooks</b></td><td>Shell commands in config, or Python callbacks from plugins. Events: <code>session_start, user_prompt, pre_tool, post_tool, stop, task_done, goal_achieved</code>.</td>
+    <td>Shell hooks get JSON on stdin; exit 0 adds stdout as context, exit 2 blocks. <code>pre_tool</code> and <code>post_tool</code> can match by tool-name glob. They run in registration order, shell first.</td></tr>
+  <tr><td><b>Plugins</b></td><td>Python files in <code>~/.cadence/plugins</code> (or the project) with a <code>register(api)</code> function that adds tools and hooks. They run in-process with full privileges.</td>
+    <td>Loaded at startup, last, so they can wrap anything. You currently have <code>guard.py</code> (blocks force-push, <code>rm -rf /</code> and writes to <code>.env</code>/keys, and adds a <code>todo_scan</code> tool).</td></tr>
+  <tr><td><b>MCP servers</b></td><td>External tool servers started as subprocesses; their tools are registered as <code>mcp__name__tool</code>.</td><td>Available to every agent, in every project.</td></tr>
+  <tr><td><b>Sandbox</b></td><td>bubblewrap (yours) around <code>bash</code>, skill scripts and verify commands: read-only host, writable project, <code>$HOME</code> hidden.</td><td>The file tools are not sandboxed by bwrap; they are confined by path checks to the project folder.</td></tr>
+</table>
+<p class="note">The post-turn reflection is wired into the server, not exposed as a hook event. If you want to attach your own logic to it, it would need a <code>reflect</code> event added to the hook list.</p>
+
+<h2 id="files">9. Files, uploads and project folders</h2>
+<h3>Project folders</h3>
+<p>A project is a directory (the folder picker can now choose any directory; <code>/</code> and the bare home folder are refused). The agent's file tools resolve every path inside that root and reject anything outside it. Cadence keeps its own per-project data in <code>&lt;project&gt;/.cadence/</code> (project skills and plugins, attachments). Switching project switches the tool set, instructions, skills, sandbox and browser.</p>
+<h3>The file explorer</h3>
+<p>Backed by <code>/api/files*</code>, all confined to the project root. Raw files are served with a sandboxing CSP so an HTML file the agent wrote cannot call the API with your session. Edits check the file's modified time so you and the agent do not overwrite each other. When the agent writes a file you get a live "edited by the agent" marker.</p>
+<h3>Uploads to chat</h3>
+<ol class="steps">
+  <li>The file is first saved to an inbox with a random prefix (limit 50 MB, images have their own limit).</li>
+  <li>When you send, non-image files are copied into <code>&lt;project&gt;/.cadence/attachments/</code>, so the agent can keep reading them with <code>read_file</code>.</li>
+  <li>The text is extracted (PDF, Office, spreadsheets, archives and so on) and the first 15,000 characters are pasted into your message. Longer files say how to read the rest.</li>
+  <li>Images go to the vision model on the message itself.</li>
+</ol>
+<h3>Canvas and browser</h3>
+<p>The canvas holds documents the agent writes (20 saved versions each; the agent re-reads before editing so it sees your changes). The browser is a real Chrome/Chromium driven through Playwright, one per project with a persistent profile under <code>~/.cadence/state/browser/</code>, that you can watch and use too.</p>
+
+<h2 id="findings">10. Findings and recommendations</h2>
+
+<div class="finding"><b>Context window is probably set too low (highest impact).</b>
+  Neither your config nor settings define <code>context_window</code> for the big model, so Cadence assumes 32,768 tokens. Compaction starts at 70% of that (about 23k tokens) and compacts down to 40%. With a larger model you are summarising history much earlier than needed, and the compaction calls themselves cost minutes on a 35B model. Set the real window under Settings → Models.</div>
+
+<div class="finding good"><b>Memory scoping: fixed.</b>
+  Each memory now records the project it was learned in. Recall, the agent's <code>memory_search</code>, the planner, brainstorming and reflection see that project's memories plus <em>shared</em> ones (project blank). Older memories load as shared. The Memory page defaults to "This project + shared", can show all projects, and new memories can be marked shared. Lessons consolidated by the daemon across several tasks are stored as shared.</div>
+
+<div class="finding"><b>The "small" model is the big model.</b>
+  Compaction, distillation, reflection and lesson consolidation all use <code>small</code>, which is set to the same 35B model. They are fine quality-wise, but each one queues on the same server and can delay your next chat message. A genuinely small model for these jobs would make them cheap.</div>
+
+<div class="finding"><b>Reflection can only see what the agent saw.</b>
+  It reads the last turn (cut to ~14k characters, tool results clipped to 400). It does not run after daemon tasks (those already write their own episodic and procedural memories). Ideas it files are goal-sized or task-sized suggestions, not active work.</div>
+
+<div class="finding"><b>The <code>stop</code> hook does not fire on interrupts or errors.</b>
+  It only runs when the model finishes normally. A hook that cleans up or logs per turn will miss stopped turns.</div>
+
+<div class="finding"><b>Daemon tasks do not draw documents live.</b>
+  Live canvas streaming is wired for chat turns. A task run by the daemon still shows its document only when the tool call completes.</div>
+
+<div class="finding"><b>Housekeeping.</b>
+  <code>~/.cadence/plugins/guard.py</code> still says "Kestrel" in its docstring (cosmetic). The memory collection in your settings is still named <code>kestrel_memory</code> (works, just an old name). Nothing ever deletes or merges memories, and de-duplication is exact-text only, so reflection will slowly accumulate near-duplicates unless pruned from the Memory page.</div>
+
+<div class="finding good"><b>Things that work well.</b>
+  Tool results are truncated and old ones shrunk before they eat the window; compaction never splits a tool call from its result; objective verify commands overrule the model's opinion of its own work; path confinement plus bwrap keep the agent inside the project; skills load progressively; and the repeated-call guard stops simple loops.</div>
+
+<footer>Generated from a read of the Cadence source in <code>src/cadence/</code> (agent.py, context.py, memory.py, tasks.py, goals.py, ideas.py, autonomy.py, hooks.py, plugins.py, skills.py, runtime.py, reflect.py, web/*).</footer>
+</div>
+<section><h2>Update: goals, priorities, memory and Brainstorm</h2><ul><li><b>Root cause of empty ideas/plans/reflections:</b> short <code>max_tokens</code> limits were consumed by the thinking model, leaving an empty answer. Structured calls now get <code>reasoning_headroom</code> (6000) extra tokens.</li><li><b>Goals:</b> every goal has a priority (1-5) and is re-evaluated every <code>goal_review_minutes</code> (60) even with tasks queued; each plan leaves a prioritised, estimated, dated next task.</li><li><b>Priority:</b> the daemon runs tasks by task priority + goal priority + user boost; while a chat turn is running only user or urgent tasks start. System-prompt sections carry weights and the lowest are trimmed first.</li><li><b>Memory:</b> reflection files episodic, semantic and procedural memories after chat turns and daemon tasks; near-duplicates are folded.</li><li><b>Hooks:</b> new events <code>goal_planned</code>, <code>heartbeat</code>, <code>reflection</code>.</li></ul></section>
+</body>
+</html>

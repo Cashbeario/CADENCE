@@ -41,6 +41,11 @@ class Task:
     project: str = ""     # project id; "" = the default workspace
     goal: str = ""        # id of the long-horizon goal this task advances
     context: str = ""     # background handed to the agent (e.g. the goal's vision)
+    priority: int = 3     # 1 (low) .. 5 (urgent); the daemon runs higher first (user tasks get a boost)
+    estimate_min: int = 0 # planned minutes of work; 0 = unknown
+    due: float = 0.0      # when it should be done by (epoch); 0 = no deadline
+    started: float = 0.0
+    finished: float = 0.0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     attempts: int = 0
     reflections: list[dict[str, Any]] = field(default_factory=list)
@@ -114,9 +119,10 @@ class TaskRunner:
         self.sandbox_for = sandbox_for
         self.hooks = hooks or Hooks(workspace=cfg.workspace)
         self.agents: dict[str, Agent] = {}  # live task agents, for steering/interrupt
+        self.on_finish: Callable[[Agent, Task], Awaitable[None]] | None = None  # e.g. the reflection pass
 
     async def run(self, task: Task, sink: EventSink | None = None) -> Task:
-        self.store.update(task, status="active")
+        self.store.update(task, status="active", started=task.started or time.time())
         agent = self.agent_factory(f"task-{task.id}", task.project) if task.project else self.agent_factory(f"task-{task.id}")
         self.agents[task.id] = agent
         self.store.update(task, session=agent.session_id)
@@ -133,7 +139,7 @@ class TaskRunner:
                 reflection = await self._reflect(task, final, verify)
                 task.reflections.append({"attempt": attempt, "verify": verify, **reflection})
                 for lesson in reflection.get("lessons", []):
-                    self.memory.add("procedural", str(lesson), ["lesson", "auto"])
+                    self.memory.add("procedural", str(lesson), ["lesson", "auto"], task.project)
                 verdict = reflection["verdict"]
                 if verdict == "done":
                     self.store.update(task, status="done", result=final)
@@ -147,8 +153,11 @@ class TaskRunner:
                 steps = "\n".join(f"- {s}" for s in reflection.get("next_steps", []))
                 prompt = (f"Reflection on attempt {attempt}: {reflection.get('critique', '')}\n"
                           f"Verification: {verify or 'n/a'}\nNext steps:\n{steps}\nContinue working on the task until the acceptance criteria are met.")
-            self.memory.add("episodic", f"Task '{task.title}' → {task.status} after {task.attempts} attempt(s). {truncate(task.result, 300)}", ["task"])
+            self.store.update(task, finished=time.time())
+            self.memory.add("episodic", f"Task '{task.title}' → {task.status} after {task.attempts} attempt(s). {truncate(task.result, 300)}", ["task"], task.project)
             self.store.update(task)
+            if self.on_finish:
+                await self.on_finish(agent, task)
             await self.hooks.emit("task_done", {"agent": agent.name, "task_id": task.id, "goal_id": task.goal, "title": task.title,
                                                 "status": task.status, "result": truncate(task.result, 2000)})
         except LLMError as exc:
@@ -173,7 +182,7 @@ class TaskRunner:
 
     @staticmethod
     def _initial_prompt(task: Task) -> str:
-        parts = [f"TASK: {task.title}"]
+        parts = [f"TASK: {task.title}  [priority {task.priority}/5" + (f", about {task.estimate_min} min" if task.estimate_min else "") + "]"]
         if task.description and task.description != task.title:
             parts.append(task.description)
         if task.context:

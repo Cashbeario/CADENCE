@@ -56,8 +56,10 @@ class Completion:
 
 @dataclass
 class StreamDelta:
-    kind: str  # "content" | "reasoning"
+    kind: str  # "content" | "reasoning" | "tool_args" (a fragment of a tool call's JSON arguments)
     text: str
+    call_id: str = ""
+    name: str = ""
 
 
 class LLM(Protocol):
@@ -112,7 +114,7 @@ class OpenAICompatLLM:
             "model": self.cfg.name,
             "messages": messages,
             "temperature": self.cfg.temperature if temperature is None else temperature,
-            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "max_tokens": (max_tokens + self.cfg.reasoning_headroom) if max_tokens else self.cfg.max_tokens,
             "stream": True,
         }
         if tools:
@@ -162,6 +164,8 @@ class OpenAICompatLLM:
                                 slot.name += fn["name"]
                             if fn.get("arguments"):
                                 slot.arguments += fn["arguments"]
+                                if on_delta:
+                                    await on_delta(StreamDelta("tool_args", fn["arguments"], slot.id, slot.name))
         except httpx.HTTPError as exc:
             raise LLMError(f"{self.cfg.name}: connection failed ({exc.__class__.__name__}: {exc})") from exc
 
@@ -172,7 +176,7 @@ class OpenAICompatLLM:
 class OpenAICompatEmbedder:
     """`/embeddings` client (LM Studio serves nomic-embed and friends here)."""
 
-    def __init__(self, base_url: str, model: str, api_key: str = "lm-studio", timeout: float = 60.0):
+    def __init__(self, base_url: str, model: str, api_key: str = "lm-studio", timeout: float = 120.0):
         self.name = model
         self.base_url = base_url
         self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), headers={"Authorization": f"Bearer {api_key}"},

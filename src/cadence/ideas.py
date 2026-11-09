@@ -7,6 +7,7 @@ With `auto_approve_ideas: true`, ideas the daemon generates are promoted to task
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ from .llm import LLMError, ModelRouter
 from .memory import MemoryStore
 from .store import JsonStore
 from .tasks import Task, TaskStore, _jaccard, _tree_snapshot, extract_json
+
+log = logging.getLogger(__name__)
 
 IDEA_STATUSES = ("new", "promoted", "dismissed")
 
@@ -42,6 +45,7 @@ class Idea:
     status: str = "new"         # new | promoted | dismissed
     promoted_to: str = ""       # "task:<id>" | "goal:<id>"
     tags: list[str] = field(default_factory=list)
+    priority: int = 3           # carried onto the task or goal it is promoted to
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
@@ -57,7 +61,7 @@ class IdeaStore(JsonStore[Idea]):
 
 def promote_to_task(ideas: IdeaStore, tasks: TaskStore, idea: Idea) -> Task:
     task = tasks.add(Task(title=idea.title, description=idea.description or idea.title, acceptance=list(idea.acceptance),
-                          verify_command=idea.verify_command, source="idea", project=idea.project))
+                          verify_command=idea.verify_command, source="idea", project=idea.project, priority=idea.priority))
     ideas.update(idea, status="promoted", promoted_to=f"task:{task.id}")
     return task
 
@@ -68,15 +72,26 @@ async def ideate(router: ModelRouter, ideas: IdeaStore, tasks: TaskStore, memory
     seen = [i.title for i in ideas.list(project=project)] + [t.title for t in tasks.list(project=project)] + \
         [g.title for g in goals]
     recent = "\n".join(f"- {t}" for t in seen[-25:]) or "(none)"
-    lessons = "\n".join(f"- {m.text}" for m in memory.recent(8, "procedural")) or "(none)"
-    user = f"Project files:\n{_tree_snapshot(workspace)}\n\nAlready known (do not repeat):\n{recent}\n\nLessons learned:\n{lessons}"
-    try:
-        comp = await router.big.complete(
-            [{"role": "system", "content": IDEA_SYSTEM.replace("{n}", str(n))}, {"role": "user", "content": user}],
-            max_tokens=1200, temperature=0.7)
-    except LLMError:
-        return []
-    items = extract_json(comp.content)
+    lessons = "\n".join(f"- {m.text}" for m in memory.recent(8, "procedural", project)) or "(none)"
+    facts = "\n".join(f"- {m.text}" for m in memory.recent(6, "semantic", project)) or "(none)"
+    aims = "\n".join(f"- (priority {g.priority}) {g.title}" for g in goals if getattr(g, "status", "") == "active") or "(none)"
+    user = (f"Project files:\n{_tree_snapshot(workspace)}\n\nActive goals (ideas should serve these first):\n{aims}\n\n"
+            f"What we know about the project:\n{facts}\n\nAlready known (do not repeat):\n{recent}\n\nLessons learned:\n{lessons}")
+    items: Any = None
+    for _attempt in range(2):  # a thinking model sometimes spends its budget or answers off-format: one retry
+        try:
+            comp = await router.big.complete(
+                [{"role": "system", "content": IDEA_SYSTEM.replace("{n}", str(n))}, {"role": "user", "content": user}],
+                max_tokens=1200, temperature=0.7)
+        except LLMError as exc:
+            log.warning("brainstorm: model unavailable: %s", exc)
+            return []
+        items = extract_json(comp.content)
+        if isinstance(items, dict):  # {"ideas":[...]}
+            items = next((v for v in items.values() if isinstance(v, list)), None)
+        if isinstance(items, list):
+            break
+        log.warning("brainstorm: reply was not a JSON list (finish=%s, %d chars)", comp.finish_reason, len(comp.content))
     if not isinstance(items, list):
         return []
     added: list[Idea] = []

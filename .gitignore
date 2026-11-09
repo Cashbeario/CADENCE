@@ -14,3 +14,4 @@ web/*.tsbuildinfo
 # Local state / agent output
 .kestrel/
 *.log
+.venv311/

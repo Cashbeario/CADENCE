@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /home/ops/Desktop/DDE/CADENCE/.venv311/bin/python -m pytest "$@"

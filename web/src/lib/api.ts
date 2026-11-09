@@ -77,12 +77,21 @@ export type Task = {
   reflections: { attempt: number; verdict: string; critique: string; verify: { exit: number; output: string } | null; lessons?: string[] }[];
   result: string;
   session: string;
+  priority: number;
+  estimate_min: number;
+  due: number;
+  started: number;
+  finished: number;
   created: number;
   updated: number;
   activity: { type: string; text: string; at: number } | null;
 };
 
 export type JournalEntry = { at: number; kind: string; text: string; task?: string; status?: string; progress?: number };
+
+export type GoalTask = {
+  id: string; title: string; status: TaskStatus; updated: number; priority: number; due: number; estimate_min: number; started: number; finished: number;
+};
 
 export type Goal = {
   id: string;
@@ -99,7 +108,10 @@ export type Goal = {
   updated: number;
   last_planned: number;
   tasks_today: number;
-  tasks: { id: string; title: string; status: TaskStatus; updated: number }[];
+  priority: number;
+  next_review: number;
+  tasks: GoalTask[];
+  next_task: GoalTask | null;
   planning: boolean;
 };
 
@@ -119,7 +131,7 @@ export type Idea = {
   updated: number;
 };
 
-export type MemoryItem = { id: string; kind: "episodic" | "semantic" | "procedural"; text: string; tags: string[]; created: number; hits: number };
+export type MemoryItem = { id: string; kind: "episodic" | "semantic" | "procedural"; text: string; tags: string[]; created: number; hits: number; project: string };
 
 export type Notice = { level: string; message: string; at: number };
 
@@ -205,6 +217,7 @@ export type FileContent = { path: string; binary: boolean; size: number; mime: s
 
 export type CanvasSummary = {
   id: string;
+  streaming?: boolean;
   title: string;
   format: "markdown" | "html" | "code" | "text";
   language: string;
@@ -262,8 +275,8 @@ export const api = {
 
   // goals
   goals: (project?: string) => req<Goal[]>(`/api/goals?${q({ project })}`),
-  addGoal: (g: { title: string; description?: string; success?: string[]; project: string; paused?: boolean }) => req<Goal>("/api/goals", json("POST", g)),
-  editGoal: (id: string, g: Partial<Pick<Goal, "title" | "description" | "success" | "status" | "progress">>) => req<Goal>(`/api/goals/${id}`, json("PATCH", g)),
+  addGoal: (g: { title: string; description?: string; success?: string[]; project: string; paused?: boolean; priority?: number }) => req<Goal>("/api/goals", json("POST", g)),
+  editGoal: (id: string, g: Partial<Pick<Goal, "title" | "description" | "success" | "status" | "progress" | "priority">>) => req<Goal>(`/api/goals/${id}`, json("PATCH", g)),
   goalAction: (id: string, action: "plan" | "note", text?: string) => req<Goal>(`/api/goals/${id}/${action}`, json("POST", { text })),
   deleteGoal: (id: string) => req<{ ok: boolean }>(`/api/goals/${id}`, { method: "DELETE" }),
 
@@ -288,9 +301,9 @@ export const api = {
   generateIdeas: (project: string, n = 3) => req<Idea[]>("/api/ideas/generate", json("POST", { project, n })),
 
   // memory
-  memory: (query: string, kind?: string) =>
-    req<{ items: MemoryItem[]; fallback: string; stats: Status["memory"] }>(`/api/memory?${q({ q: query, kind: kind || undefined })}`),
-  addMemory: (kind: string, text: string) => req<MemoryItem>("/api/memory", json("POST", { kind, text })),
+  memory: (query: string, kind?: string, project?: string) =>
+    req<{ items: MemoryItem[]; fallback: string; stats: Status["memory"] }>(`/api/memory?${q({ q: query, kind: kind || undefined, project: project || undefined })}`),
+  addMemory: (kind: string, text: string, project = "") => req<MemoryItem>("/api/memory", json("POST", { kind, text, project })),
   deleteMemory: (id: string) => req<{ ok: boolean }>(`/api/memory/${id}`, { method: "DELETE" }),
 
   // settings & models
@@ -344,6 +357,7 @@ export const api = {
   testHook: (h: HookRow, project: string) => req<{ blocked: boolean; reason: string; context: string }>("/api/hooks/test", json("POST", { ...h, project })),
 
   // files
+  browseDirs: (path = "") => req<{ path: string; parent: string | null; home: string; dirs: { name: string; path: string }[] }>(`/api/fs?${q({ path })}`),
   files: (project: string, path = "") => req<{ path: string; root: string; entries: FileEntry[]; truncated: boolean }>(`/api/files?${q({ project, path })}`),
   searchFiles: (project: string, query: string) => req<FileEntry[]>(`/api/files/search?${q({ project, q: query })}`),
   readFile: (project: string, path: string) => req<FileContent>(`/api/files/read?${q({ project, path })}`),

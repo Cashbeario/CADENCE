@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 from aiohttp import WSMsgType, web
 
 from ..agent import Agent, Event
+from ..canvas import FORMATS
 from ..llm import LLMError, OpenAICompatLLM, content_text
 from ..runtime import Runtime
 from ..documents import ExtractError, extract
@@ -134,6 +135,7 @@ class Hub:
         self.rt = rt
         self.sessions: dict[str, LiveSession] = {}
         self.clients: set[web.WebSocketResponse] = set()
+        self._bg: set[asyncio.Task[None]] = set()  # fire-and-forget work (reflection) kept alive until done
         self.watching: dict[web.WebSocketResponse, set[str]] = {}  # ws → projects whose browser it streams
         self.notices: list[dict[str, Any]] = []
         self.task_activity: dict[str, dict[str, Any]] = {}
@@ -239,8 +241,15 @@ class Hub:
         live.updated = time.time()
         await self.broadcast({"kind": "turn", "session": sid, "state": "started", "project": a.project,
                               "title": _first_user_text(a.ctx.messages) if a.ctx.messages else text[:70]})
+        streams: dict[str, dict[str, Any]] = {}
+        daemon = self.rt.daemon
+        if daemon:
+            daemon.user_turns += 1  # a user directive in flight outranks background tasks (see Daemon._launch_ready)
         try:
             async for ev in a.run(text, images):
+                if ev.type == "tool_args":  # a canvas document being written: draw it as it arrives
+                    await self._stream_canvas(a.project, sid, streams, ev.data)
+                    continue
                 if ev.type == "status":
                     live.usage = {"tokens": ev.data["tokens"], "window": ev.data["window"], "iteration": ev.data["iteration"]}
                 await self.broadcast({"kind": "agent", "session": sid, "event": {"type": ev.type, "data": ev.data}})
@@ -249,10 +258,55 @@ class Hub:
             log.exception("turn crashed")
             await self.broadcast({"kind": "agent", "session": sid, "event": {"type": "error", "data": {"message": f"{exc.__class__.__name__}: {exc}"}}})
         finally:
+            if daemon:
+                daemon.user_turns = max(0, daemon.user_turns - 1)
+                daemon.wake()
+            await self._end_streams(a.project, streams)
             live.updated = time.time()
             a.save_session()
+            t = asyncio.create_task(self.rt.reflect_agent(a), name=f"reflect-{sid}")
+            self._bg.add(t)
+            t.add_done_callback(self._bg.discard)
             await self.broadcast({"kind": "turn", "session": sid, "state": "finished", "title": _first_user_text(a.ctx.messages),
                                   "project": a.project})
+
+    async def _stream_canvas(self, project: str, sid: str, streams: dict[str, dict[str, Any]], d: dict[str, Any]) -> None:
+        """Create the document as soon as the model starts a canvas_write, then keep it up to date (≈4×/s)."""
+        from ..canvas import CanvasDoc, partial_args
+
+        st = streams.setdefault(d["id"], {"raw": "", "doc": None, "sent": 0.0, "n": 0})
+        st["raw"] += d["text"]
+        f = partial_args(st["raw"])
+        if f.get("id") or "content" not in f:  # editing an existing document, or the content has not started yet
+            return
+        now = time.monotonic()
+        doc = st["doc"]
+        if doc is None:
+            fmt = f.get("format", "markdown")
+            doc = st["doc"] = self.rt.canvas.add(CanvasDoc(title=(f.get("title") or "Untitled").strip()[:120] or "Untitled", format=fmt if fmt in FORMATS else "markdown",
+                                                           project=project, session=sid, streaming=True))
+            first = True
+        elif now - st["sent"] < 0.25:
+            return
+        else:
+            first = False
+        st["sent"] = now
+        self.rt.canvas.update(doc, content=f["content"], title=(f.get("title") or doc.title).strip()[:120] or doc.title)
+        await self.broadcast({"kind": "canvas", "project": project, "doc": doc.summary(), "focus": first, "streaming": True,
+                              "content": doc.content})
+
+    async def _end_streams(self, project: str, streams: dict[str, dict[str, Any]]) -> None:
+        """A turn ended with live drafts still open (interrupted or errored): keep what was written, or drop an empty one."""
+        for st in streams.values():
+            doc = st["doc"]
+            if doc is None or self.rt.canvas.get(doc.id) is None or not doc.streaming:
+                continue
+            if doc.content.strip():
+                self.rt.canvas.update(doc, streaming=False)
+                await self.broadcast({"kind": "canvas", "project": project, "doc": doc.summary(), "focus": False})
+            else:
+                self.rt.canvas.delete(doc.id)
+                await self.broadcast({"kind": "canvas_deleted", "project": project, "id": doc.id})
 
     async def _side_effects(self, project: str, ev: Event, sid: str = "", agent: Agent | None = None) -> None:
         if ev.type == "tool_call":
@@ -268,6 +322,8 @@ class Hub:
         n = {"kind": "notice", "level": level, "message": message, "at": time.time()}
         self.notices = (self.notices + [n])[-100:]
         await self.broadcast(n)
+        if level in ("task", "goal", "cycle"):  # daemon activity changed goals/tasks/ideas/memory: refresh open views
+            await self.broadcast({"kind": "changed", "what": "work"})
 
     async def task_event(self, tid: str, ev: Event) -> None:
         task = self.rt.tasks.get(tid)
@@ -378,7 +434,7 @@ def build_app(rt: Runtime, *, allowed_hosts: set[str] | None = None, token: str 
             "mcp": [{"name": n, "connected": c, "tools": t, "error": e} for n, c, t, e in rt.mcp.status()],
             "skills": [{"name": s.name, "description": s.description} for s in scope.skills.skills.values()],
             "tools": [{"name": t.name, "source": t.source, "description": t.description, "read_only": t.read_only}
-                      for t in scope.registry.all().values()],
+                      for t in rt.new_agent("status", scope.project.id).registry.all().values()],  # agents add their own (memory, todos, subagents)
             "channels": [c.name for c in app.get(CHANNELS_KEY, [])],
             "restart_required": sorted(rt.restart_required),
             "daemon": None if d is None else {
@@ -439,7 +495,9 @@ def build_app(rt: Runtime, *, allowed_hosts: set[str] | None = None, token: str 
     @r.get("/api/memory")
     async def memory(req: web.Request) -> web.Response:
         q, kind = req.query.get("q", "").strip(), req.query.get("kind") or None
-        hits = await rt.memory.asearch(q, k=int(req.query.get("k", 30)), kind=kind) if q else rt.memory.recent(60, kind)[::-1]
+        scope = rt.project(req.query["project"]).id if req.query.get("project") else None  # absent = every project's memories
+        hits = await rt.memory.asearch(q, k=int(req.query.get("k", 30)), kind=kind, project=scope) if q \
+            else rt.memory.recent(60, kind, scope)[::-1]
         return web.json_response({"items": [asdict(h) for h in hits], "fallback": rt.memory.last_error if q else "",
                                   "stats": rt.memory.stats()})
 
@@ -447,7 +505,8 @@ def build_app(rt: Runtime, *, allowed_hosts: set[str] | None = None, token: str 
     async def add_memory(req: web.Request) -> web.Response:
         data = await body(req)
         try:
-            item = rt.memory.add(str(data.get("kind", "semantic")), str(data.get("text", "")), list(data.get("tags") or []))
+            item = rt.memory.add(str(data.get("kind", "semantic")), str(data.get("text", "")), list(data.get("tags") or []),
+                                  rt.project(str(data["project"])).id if data.get("project") else "")  # "" = shared
         except ValueError as exc:
             raise web.HTTPBadRequest(text=str(exc))
         return web.json_response(asdict(item))

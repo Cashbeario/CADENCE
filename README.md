@@ -254,6 +254,12 @@ cd web && npm install && npm run dev     # hot-reloading UI against a running `c
 cd web && npm run build                  # writes the production UI to src/cadence/web/static/
 ```
 
+> **Running tests in this sandbox.** The workspace is the only location that persists between shells, and nothing outside it (including `$HOME`, `/tmp`, and on-PATH dirs) survives across calls — so bare `pytest` isn't available here. Use the bundled venv instead:
+>
+> ```bash
+> .venv311/bin/python -m pytest tests/test_ideas.py -q   # or: ./pytest ... (a persistent wrapper in this repo)
+> ```
+
 The tests cover the agent loop, compaction, tasks, goals and the planner, ideas, projects and archiving, the
 daemon, MCP (including hot add/remove), vector memory (local and Qdrant), hooks, plugins (live reload),
 skills, settings, the sandbox, Telegram, WhatsApp, the web API and WebSocket, files, canvas, any-file

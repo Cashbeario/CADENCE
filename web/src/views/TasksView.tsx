@@ -105,6 +105,13 @@ function TaskCard({ t, run, onEdit, onDelete, onOpenSession }: {
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <TaskBadge status={t.status} />
+            <span className="rounded-full border border-line px-2 py-0.5 text-[11px] text-muted" title="priority">P{t.priority}</span>
+            {t.due > 0 && !["done", "failed"].includes(t.status) && (
+              <span className={clsx("text-[11.5px]", t.due * 1000 < Date.now() ? "text-warn" : "text-faint")}>
+                {t.due * 1000 < Date.now() ? "overdue" : "due"} {new Date(t.due * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+              </span>
+            )}
+            {t.started > 0 && t.finished > 0 && <span className="text-[11.5px] text-faint">took {Math.max(1, Math.round((t.finished - t.started) / 60))} min</span>}
             {t.source !== "user" && <span className="chip border-line text-faint">{t.source === "planner" ? "from planner" : t.source === "idea" ? "from idea" : "auto"}</span>}
             {t.goal_title && <span className="chip border-violet/30 text-violet"><Target size={10} /> {t.goal_title}</span>}
             <span className="text-[11px] text-faint">{ago(t.updated)} · {t.attempts} attempt{t.attempts === 1 ? "" : "s"}</span>

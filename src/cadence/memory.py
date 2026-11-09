@@ -40,6 +40,9 @@ _STOP = frozenset(
 EMBED_BATCH = 32
 
 
+NEAR_DUPLICATE = 0.7  # token-overlap (Jaccard) at which a new memory counts as one we already have
+
+
 def _tokens(text: str) -> list[str]:
     return [w for w in _WORD.findall(text.lower()) if w not in _STOP]
 
@@ -57,6 +60,7 @@ class MemoryItem:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
     created: float = field(default_factory=time.time)
     hits: int = 0
+    project: str = ""  # project id it was learned in; "" = shared by every project (also every memory from before scoping)
 
 
 class VectorError(RuntimeError):
@@ -242,21 +246,50 @@ class MemoryStore:
             except (json.JSONDecodeError, TypeError):
                 continue  # tolerate partial/corrupt lines
 
-    def add(self, kind: str, text: str, tags: list[str] | None = None) -> MemoryItem:
+    @staticmethod
+    def _visible(item: MemoryItem, project: str | None) -> bool:
+        """`project=None` sees everything; otherwise a project sees its own memories plus the shared ones."""
+        return project is None or item.project in ("", project)
+
+    def add(self, kind: str, text: str, tags: list[str] | None = None, project: str = "") -> MemoryItem:
         if kind not in KINDS:
             raise ValueError(f"kind must be one of {KINDS}")
         text = text.strip()
         if not text:
             raise ValueError("memory text is empty")
-        for existing in self._items:
-            if existing.kind == kind and existing.text == text:
+        words = set(_tokens(text))
+        for existing in self._items:  # exact or near-duplicate (same kind and project): keep the first
+            if existing.kind == kind and existing.project == project and (
+                    existing.text == text or self._overlap(words, set(_tokens(existing.text))) >= NEAR_DUPLICATE):
                 return existing
-        item = MemoryItem(kind=kind, text=text, tags=tags or [])
+        item = MemoryItem(kind=kind, text=text, tags=tags or [], project=project)
         with self._lock:
             self._items.append(item)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
         return item
+
+    @staticmethod
+    def _overlap(a: set[str], b: set[str]) -> float:
+        return len(a & b) / len(a | b) if a and b else 0.0
+
+    def dedupe(self) -> int:
+        """Drop near-duplicate memories (same kind and project), keeping the oldest. Returns how many went."""
+        keep: list[MemoryItem] = []
+        sets: list[set[str]] = []
+        for item in self._items:
+            words = set(_tokens(item.text))
+            if any(k.kind == item.kind and k.project == item.project and (k.text == item.text or self._overlap(words, w) >= NEAR_DUPLICATE)
+                   for k, w in zip(keep, sets)):
+                continue
+            keep.append(item)
+            sets.append(words)
+        removed = len(self._items) - len(keep)
+        if removed:
+            with self._lock:
+                self._items = keep
+                atomic_write(self.path, "".join(json.dumps(asdict(i), ensure_ascii=False) + "\n" for i in keep))
+        return removed
 
     def delete(self, mid: str) -> bool:
         """Forget one memory. Its vector stays in the index but is ignored (ranking skips unknown ids)."""
@@ -269,13 +302,13 @@ class MemoryStore:
         return True
 
     # ------------------------------------------------------------- retrieval
-    def _keyword_scores(self, query: str, kind: str | None) -> dict[str, float]:
+    def _keyword_scores(self, query: str, kind: str | None, project: str | None = None) -> dict[str, float]:
         q = set(_tokens(query))
         if not q:
             return {}
         scores: dict[str, float] = {}
         for item in self._items:
-            if kind and item.kind != kind:
+            if (kind and item.kind != kind) or not self._visible(item, project):
                 continue
             words = set(_tokens(item.text)) | {t.lower() for t in item.tags}
             overlap = len(q & words)
@@ -297,14 +330,14 @@ class MemoryStore:
             h.hits += 1
         return hits
 
-    def search(self, query: str, k: int = 5, kind: str | None = None) -> list[MemoryItem]:
+    def search(self, query: str, k: int = 5, kind: str | None = None, project: str | None = None) -> list[MemoryItem]:
         """Keyword-only retrieval (synchronous; no model calls)."""
-        return self._rank(self._keyword_scores(query, kind), k)
+        return self._rank(self._keyword_scores(query, kind, project), k)
 
-    async def asearch(self, query: str, k: int = 5, kind: str | None = None) -> list[MemoryItem]:
+    async def asearch(self, query: str, k: int = 5, kind: str | None = None, project: str | None = None) -> list[MemoryItem]:
         """Hybrid vector + keyword retrieval; falls back to `search` if the embedder/index is down."""
         if not self.semantic or not query.strip():
-            return self.search(query, k, kind)
+            return self.search(query, k, kind, project)
         try:
             await self.sync_index()
             [qvec] = await self.semantic.embedder.embed([self.semantic.query_prefix + query])
@@ -312,14 +345,15 @@ class MemoryStore:
         except Exception as exc:  # noqa: BLE001 — retrieval must never break the agent
             self.last_error = f"{exc.__class__.__name__}: {exc}"
             log.warning("semantic memory unavailable, using keywords: %s", self.last_error)
-            return self.search(query, k, kind)
+            return self.search(query, k, kind, project)
         self.last_error = ""
-        kw = self._keyword_scores(query, kind)
+        kw = self._keyword_scores(query, kind, project)
+        visible = {i.id for i in self._items if self._visible(i, project)}
         top_kw = max(kw.values(), default=0.0) or 1.0
         w, floor = self.semantic_weight, self.min_similarity
         scores: dict[str, float] = {}
         for mid, sim in vec_hits:
-            if sim > floor:
+            if sim > floor and mid in visible:
                 scores[mid] = w * (sim - floor) / (1.0 - floor)
         for mid, s in kw.items():
             scores[mid] = scores.get(mid, 0.0) + (1 - w) * (s / top_kw)
@@ -339,8 +373,8 @@ class MemoryStore:
             self._indexed.update(i.id for i in batch)
         return len(missing)
 
-    def recent(self, k: int = 5, kind: str | None = None) -> list[MemoryItem]:
-        items = [i for i in self._items if not kind or i.kind == kind]
+    def recent(self, k: int = 5, kind: str | None = None, project: str | None = None) -> list[MemoryItem]:
+        items = [i for i in self._items if (not kind or i.kind == kind) and self._visible(i, project)]
         return items[-k:]
 
     def stats(self) -> dict[str, Any]:

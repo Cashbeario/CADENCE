@@ -254,6 +254,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "task_activity":
         case "changed":
         case "ideas":
+        case "memory":
           dispatch({ t: "tick" });
           if (m.kind === "changed" && m.what === "projects") refreshProjects().catch(() => undefined);
           break;

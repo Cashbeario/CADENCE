@@ -43,12 +43,31 @@ Workspace root: {workspace}
 
 @dataclass
 class Event:
-    type: str  # status|thinking|token|tool_call|tool_result|compaction|message_done|interrupted|error
+    type: str  # status|thinking|token|tool_args|tool_call|tool_result|compaction|message_done|interrupted|error
     data: dict[str, Any] = field(default_factory=dict)
 
 
 class _Interrupted(Exception):
     pass
+
+
+SYSTEM_SHARE = 0.4  # at most this fraction of the context window goes to the system prompt
+
+
+def fit_by_weight(parts: list[tuple[int, str]], budget: int) -> str:
+    """Join prompt sections (weight 1-10, higher = more important). When over `budget` characters the lowest-weight
+    sections are cut first (halved, then dropped), so instructions and the user's task list outlive skill indexes."""
+    texts = [t for _w, t in parts]
+    order = sorted(range(len(parts)), key=lambda i: (parts[i][0], -i))
+    for stage in ("halve", "drop"):
+        for i in order:
+            if sum(map(len, texts)) <= budget or parts[i][0] >= 9:
+                break
+            if stage == "halve" and len(texts[i]) > 800:
+                texts[i] = texts[i][: len(texts[i]) // 2] + "\n…(trimmed to fit the context window)"
+            elif stage == "drop":
+                texts[i] = ""
+    return "\n\n".join(t for t in texts if t)
 
 
 class Agent:
@@ -123,16 +142,16 @@ class Agent:
 
     # ---------------------------------------------------------- system prompt
     def system_prompt(self) -> str:
-        parts = [SYSTEM_PROMPT.format(workspace=self.cfg.workspace)]
+        parts: list[tuple[int, str]] = [(10, SYSTEM_PROMPT.format(workspace=self.cfg.workspace))]
         for label, path in (
             ("SOUL.md", self.cfg.workspace / "SOUL.md"),
             ("AGENTS.md", self.cfg.workspace / "AGENTS.md"),
             ("global SOUL.md", self.cfg.home / "SOUL.md"),
         ):
             if path.is_file():
-                parts.append(f"## {label}\n{truncate(path.read_text(encoding='utf-8', errors='ignore'), 6000)}")
+                parts.append((8, f"## {label}\n{truncate(path.read_text(encoding='utf-8', errors='ignore'), 6000)}"))
         if self.extra_instructions:
-            parts.append(self.extra_instructions)
+            parts.append((9, self.extra_instructions))
         surfaces = []
         if self.registry.get("canvas_write"):
             surfaces.append("- Canvas: put documents the user will read, review or edit (plans, reports, specs, drafts, "
@@ -142,21 +161,21 @@ class Agent:
             surfaces.append("- Browser: `browser_*` tools drive a real browser the user watches and can use too. "
                             "If a page needs a login or captcha, ask the user to do it in the browser panel, then `browser_snapshot`.")
         if surfaces:
-            parts.append("## Shared with the user\n" + "\n".join(surfaces))
+            parts.append((5, "## Shared with the user\n" + "\n".join(surfaces)))
         index = self.skills.index()
         if index:
-            parts.append("## Available skills (load with `load_skill`)\n" + index)
+            parts.append((4, "## Available skills (load with `load_skill`)\n" + index))
         if self.todos:
-            parts.append("## Current task list\n" + render_todos(self.todos))
+            parts.append((8, "## Current task list\n" + render_todos(self.todos)))
         notes = self.scratchpad.render()
         if notes:
-            parts.append("## Scratchpad\n" + notes)
+            parts.append((5, "## Scratchpad\n" + notes))
         if self._recalled:
-            parts.append("## Relevant memory\n" + self._recalled)
-        return "\n\n".join(parts)
+            parts.append((6, "## Relevant memory\n" + self._recalled))
+        return fit_by_weight(parts, int(self.cfg.big.context_window * SYSTEM_SHARE * 3.5))
 
     async def _recall(self, query: str) -> None:
-        hits = await self.memory.asearch(query, k=5)
+        hits = await self.memory.asearch(query, k=5, project=self.project)
         self._recalled = "\n".join(f"- ({h.kind}) {h.text}" for h in hits)
 
     # ------------------------------------------------------------------- loop
@@ -204,6 +223,9 @@ class Agent:
                         completion = item
                     elif item.kind == "reasoning":
                         yield Event("thinking", {"text": item.text})
+                    elif item.kind == "tool_args":
+                        if item.name.startswith("canvas_write"):  # lets the UI draw the document while the model writes it
+                            yield Event("tool_args", {"id": item.call_id, "name": item.name, "text": item.text})
                     else:
                         yield Event("token", {"text": item.text})
             except _Interrupted:
@@ -356,11 +378,11 @@ class Agent:
             kind = str(args.get("kind", "procedural"))
             if kind not in KINDS:
                 return f"ERROR: kind must be one of {', '.join(KINDS)}"
-            item = self.memory.add(kind, str(args.get("text", "")), list(args.get("tags") or []))
+            item = self.memory.add(kind, str(args.get("text", "")), list(args.get("tags") or []), self.project)
             return f"stored {item.kind} memory {item.id}"
 
         async def memory_search(args: dict[str, Any]) -> str:
-            hits = await self.memory.asearch(str(args.get("query", "")), k=int(args.get("k", 5) or 5), kind=args.get("kind"))
+            hits = await self.memory.asearch(str(args.get("query", "")), k=int(args.get("k", 5) or 5), kind=args.get("kind"), project=self.project)
             return "\n".join(f"[{h.kind}] {h.text}" for h in hits) or "(nothing found)"
 
         async def scratchpad_set(args: dict[str, Any]) -> str:

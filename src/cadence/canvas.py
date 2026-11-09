@@ -29,6 +29,7 @@ class CanvasDoc:
     project: str = ""
     author: str = "agent"     # who saved last: agent | user
     session: str = ""         # chat session that created it
+    streaming: bool = False   # the agent is still writing it (a draft shown live; canvas_write claims it when the call completes)
     versions: list[dict[str, Any]] = field(default_factory=list)  # [{at, author, content}], oldest first
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created: float = field(default_factory=time.time)
@@ -56,6 +57,68 @@ class CanvasStore(JsonStore[CanvasDoc]):
         return self.update(doc, content=content, author=author, **changes)
 
 
+_ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "/": "/", "\\": "\\", '"': '"'}
+
+
+def partial_args(raw: str) -> dict[str, str]:
+    """String fields of a JSON object that may be cut off mid-value (a tool call still being generated)."""
+    out: dict[str, str] = {}
+    i, n = 0, len(raw)
+    while i < n:
+        if raw[i] != '"':
+            i += 1
+            continue
+        j, key = i + 1, []
+        while j < n and raw[j] != '"':
+            key.append(raw[j])
+            j += 2 if raw[j] == "\\" else 1
+        if j >= n:
+            break
+        k = j + 1
+        while k < n and raw[k] in " \t\r\n":
+            k += 1
+        if k >= n or raw[k] != ":":  # a string value, not a key: skip past it
+            i = j + 1
+            continue
+        k += 1
+        while k < n and raw[k] in " \t\r\n":
+            k += 1
+        if k >= n:
+            break
+        if raw[k] != '"':  # non-string value: skip to the next top-level separator
+            while k < n and raw[k] not in ",}":
+                k += 1
+            i = k
+            continue
+        k += 1
+        val: list[str] = []
+        while k < n and raw[k] != '"':
+            c = raw[k]
+            if c == "\\":
+                if k + 1 >= n:
+                    break
+                e = raw[k + 1]
+                if e == "u":
+                    if k + 6 > n:
+                        break
+                    try:
+                        val.append(chr(int(raw[k + 2:k + 6], 16)))
+                    except ValueError:
+                        pass
+                    k += 6
+                    continue
+                val.append(_ESC.get(e, e))
+                k += 2
+                continue
+            val.append(c)
+            k += 1
+        out[("".join(key))] = "".join(val)
+        if k >= n:
+            break
+        i = k + 1
+    return out
+
+
 Publish = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -80,6 +143,10 @@ def canvas_tools(store: CanvasStore, project: str, publish: Publish | None, work
         if fmt not in FORMATS:
             raise ToolError(f"format must be one of {', '.join(FORMATS)}")
         ref = str(args.get("id", "")).strip()
+        drafts = [d for d in store.list(project) if d.streaming]  # newest first; a draft is being drawn live by this very call
+        if ref:  # updating an existing document: a live draft from this call was a misread, drop it
+            for draft in drafts:
+                store.delete(draft.id)
         if ref:
             doc = find(ref)
             store.save(doc, content, "agent", title=title or doc.title, format=fmt, language=str(args.get("language", doc.language)))
@@ -87,7 +154,12 @@ def canvas_tools(store: CanvasStore, project: str, publish: Publish | None, work
         else:
             if not title:
                 raise ToolError("title is required for a new document")
-            doc = store.add(CanvasDoc(title=title[:120], content=content, format=fmt, language=str(args.get("language", "")),
+            draft = next((d for d in drafts if d.title == title[:120]), drafts[0] if drafts else None)
+            if draft:
+                doc = store.update(draft, title=title[:120], content=content, format=fmt, language=str(args.get("language", "")),
+                                   streaming=False, author="agent")
+            else:
+                doc = store.add(CanvasDoc(title=title[:120], content=content, format=fmt, language=str(args.get("language", "")),
                                       project=project, session=session()))
             verb = "created"
         await announce(doc)

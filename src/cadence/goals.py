@@ -32,9 +32,18 @@ PLAN_SYSTEM = (
     '"status":"working|achieved|needs_user","question":"only if needs_user: what you need from the user",'
     '"tasks":[{"title","description","acceptance":["..."],"verify_command":"shell command that exits 0 when done, or empty"}]}\n'
     "Rules: propose at most {n} tasks, each small enough for one focused session and concretely verifiable. "
+    "When status=working you MUST propose at least one task unless you may not propose any: the goal always needs a "
+    "concrete, time-boxed NEXT task (estimate_min <= 60). priority 5 = do first, 1 = whenever. "
     "Do not repeat tasks that are already done or queued. status=achieved only if EVERY success criterion is "
     "demonstrably met by the evidence. Never propose destructive or out-of-project work."
 )
+
+
+def _clamp(value: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(float(value))))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -52,6 +61,8 @@ class Goal:
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
     last_planned: float = 0.0
+    priority: int = 3               # 1 (low) .. 5 (urgent): weighs this goal's tasks against other goals and user work
+    next_review: float = 0.0        # when the planner next re-evaluates the goal, even with tasks still queued
     day: str = ""                   # for the per-day task budget
     tasks_today: int = 0
 
@@ -95,15 +106,20 @@ class Planner:
                 + (f"Goal success criteria:\n{crit}\n" if crit else "")
                 + (f"Where things stand: {goal.assessment}" if goal.assessment else "")).strip()
 
+    def schedule_review(self, goal: Goal) -> None:
+        self.goals.update(goal, next_review=time.time() + float(getattr(self.cfg, "goal_review_minutes", 60)) * 60)
+
     async def plan(self, goal: Goal, workspace: Path, n: int = 2) -> list[Task]:
-        """One planning step. Returns the tasks it queued (possibly none)."""
-        n = min(n, self.budget_left(goal))
+        """One planning step. Returns the tasks it queued (possibly none). Keeps up to `n` tasks open, so a
+        review of a goal that still has work queued only tops the queue up."""
+        n = min(max(0, n - len(self.open_tasks(goal))), self.budget_left(goal))
+        self.schedule_review(goal)
         history = []
         for t in self.tasks.list(goal=goal.id)[-12:]:
             history.append(f"- [{t.status}] {t.title}" + (f" → {truncate(t.result, 240)}" if t.result else ""))
         journal = "\n".join(f"- ({e['kind']}) {truncate(e['text'], 300)}" for e in goal.journal[-12:]) or "(empty)"
-        lessons = "\n".join(f"- {m.text}" for m in self.memory.recent(6, "procedural")) or "(none)"
-        user = (f"GOAL: {goal.title}\nVISION: {goal.description or '(none)'}\nSUCCESS CRITERIA:\n"
+        lessons = "\n".join(f"- {m.text}" for m in self.memory.recent(6, "procedural", goal.project)) or "(none)"
+        user = (f"GOAL: {goal.title} (priority {goal.priority}/5)\nVISION: {goal.description or '(none)'}\nSUCCESS CRITERIA:\n"
                 + ("\n".join(f"- {c}" for c in goal.success) or "- (none given: infer sensible ones from the vision)")
                 + f"\n\nTASKS SO FAR:\n{chr(10).join(history) or '(none yet)'}\n\nJOURNAL:\n{journal}\n\n"
                 f"LESSONS LEARNED:\n{lessons}\n\nPROJECT FILES:\n{_tree_snapshot(workspace)}\n\n"
@@ -130,7 +146,7 @@ class Planner:
         if status == "achieved" and not self.open_tasks(goal):
             self.goals.update(goal, status="achieved", progress=100, question="")
             self.goals.log(goal, "achieved", assessment or "planner judged every success criterion met")
-            self.memory.add("episodic", f"Goal '{goal.title}' achieved. {truncate(assessment, 300)}", ["goal"])
+            self.memory.add("episodic", f"Goal '{goal.title}' achieved. {truncate(assessment, 300)}", ["goal"], goal.project)
             return []
         if status == "needs_user":
             q = str(data.get("question", "")).strip() or assessment or "the planner needs your input"
@@ -145,13 +161,22 @@ class Planner:
             title = str(it["title"]).strip()[:120]
             if any(_jaccard(title, e) >= 0.7 for e in existing):
                 continue
+            prio = _clamp(it.get("priority"), goal.priority, 1, 5)
+            est = _clamp(it.get("estimate_min"), 30, 5, 480)
             task = self.tasks.add(Task(
+                priority=prio, estimate_min=est, due=time.time() + est * 60,
                 title=title, description=str(it.get("description", "") or title),
                 acceptance=[str(a) for a in it.get("acceptance") or []][:6],
                 verify_command=str(it.get("verify_command", "") or ""), status="pending", source="planner",
                 project=goal.project, goal=goal.id, context=self.context(goal)))
             existing.append(title)
             added.append(task)
+        if not added and n and status == "working" and not self.open_tasks(goal):
+            title = f"Take the next step on: {goal.title}"[:120]  # the goal must always have a trackable next task
+            added.append(self.tasks.add(Task(
+                title=title, description=f"{assessment or goal.description}\nPick the single most valuable next step toward the "
+                "goal, do it, and report what changed.", status="pending", source="planner", project=goal.project, goal=goal.id,
+                context=self.context(goal), priority=goal.priority, estimate_min=30, due=time.time() + 1800)))
         self.goals.update(goal, tasks_today=goal.tasks_today + len(added))
         summary = assessment or "planned"
         if added:

@@ -4,6 +4,7 @@ import {
   PencilLine, RefreshCw, Save, Search, TextCursorInput, Upload,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { FolderPicker } from "../components/FolderPicker";
 import { LookPanel, LOOKABLE, RichPreview, richKind } from "../components/FilePreview";
 import { Markdown } from "../components/Messages";
 import { act, ago, CodeEditor, ConfirmButton, Empty, Field, Modal, toast } from "../components/ui";
@@ -27,7 +28,7 @@ function size(n: number) {
 }
 
 export function FilesView({ onDiscuss }: { onDiscuss: (text: string) => void }) {
-  const { project, current } = useStore();
+  const { project, current, projects, setProject, refreshProjects } = useStore();
   const [tree, setTree] = useState<Record<string, FileEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set([""]));
   const [hidden, setHidden] = useState(false);
@@ -41,6 +42,7 @@ export function FilesView({ onDiscuss }: { onDiscuss: (text: string) => void }) 
   const [results, setResults] = useState<FileEntry[] | null>(null);
   const [dialog, setDialog] = useState<null | { kind: "file" | "folder" | "rename"; base: string }>(null);
   const [drag, setDrag] = useState(false);
+  const [picking, setPicking] = useState(false);
   const uploadRef = useRef<HTMLInputElement>(null);
   const dirty = !!file && !file.binary && draft !== file.content;
 
@@ -159,6 +161,18 @@ export function FilesView({ onDiscuss }: { onDiscuss: (text: string) => void }) 
     );
   };
 
+  const pickFolder = async (path: string) => {
+    setPicking(false);
+    const home = path.replace(/\/+$/, "");
+    const known = projects.find((p) => p.path.replace(/\/+$/, "") === home);
+    if (known) return setProject(known.id);
+    const p = await act(() => api.addProject({ path }), `Opened ${path} as a new project`);
+    if (p) {
+      await refreshProjects();
+      setProject(p.id);
+    }
+  };
+
   const isImage = selected && IMAGE.test(selected);
   const isHtml = selected && /\.html?$/i.test(selected);
   const isMd = selected && /\.md$/i.test(selected);
@@ -168,10 +182,11 @@ export function FilesView({ onDiscuss }: { onDiscuss: (text: string) => void }) 
     <div className="flex h-full min-w-0 flex-1" onDragOver={(e) => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={onDrop}>
       <div className={clsx("flex w-72 shrink-0 flex-col border-r border-line", drag && "bg-brand/5 ring-2 ring-inset ring-brand/40")}>
         <div className="flex h-14 shrink-0 items-center gap-1 border-b border-line px-3">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 cursor-pointer" title="Change folder" onClick={() => setPicking(true)}>
             <div className="truncate text-sm font-medium">{current?.name}</div>
             <div className="truncate font-mono text-[10.5px] text-faint">{current?.path.replace(/^\/home\/[^/]+/, "~")}</div>
           </div>
+          <button className="btn-ghost px-1.5" title="Change folder" onClick={() => setPicking(true)}><FolderOpen size={15} /></button>
           <button className="btn-ghost px-1.5" title="New file" onClick={() => setDialog({ kind: "file", base: selectedDir })}><FilePlus2 size={15} /></button>
           <button className="btn-ghost px-1.5" title="New folder" onClick={() => setDialog({ kind: "folder", base: selectedDir })}><FolderPlus size={15} /></button>
           <button className="btn-ghost px-1.5" title="Upload (or drop files here)" onClick={() => uploadRef.current?.click()}><Upload size={15} /></button>
@@ -253,6 +268,7 @@ export function FilesView({ onDiscuss }: { onDiscuss: (text: string) => void }) 
           </>
         )}
       </div>
+      <FolderPicker open={picking} start={current?.path} onClose={() => setPicking(false)} onPick={(p) => void pickFolder(p)} />
       <NameDialog dialog={dialog} onClose={() => setDialog(null)} onDone={async (path) => {
         const d = dialog!;
         const parentOf = (p: string) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");

@@ -432,3 +432,16 @@ async def test_bridge_steers_a_busy_chat_instead_of_starting_a_second_turn(cfg, 
     assert replies[-1] == "first done"
     assert any("also check the docs" in str(m.get("content")) for m in router.big.calls[0])
     await rt.close()
+
+
+async def test_memory_is_scoped_to_its_project_but_shared_items_reach_everyone(tmp_path):
+    from cadence.memory import MemoryStore
+    m = MemoryStore(tmp_path / "m.jsonl")
+    m.add("semantic", "garden uses eleventy for the static site", [], "garden")
+    m.add("semantic", "the mcp server speaks stdio json-rpc", [], "mcp")
+    m.add("procedural", "always run the formatter before committing a site", [])  # shared
+    seen = {i.text for i in await m.asearch("site eleventy mcp formatter", k=10, project="garden")}
+    assert seen == {"garden uses eleventy for the static site", "always run the formatter before committing a site"}
+    assert len(m.recent(10, project="mcp")) == 2 and len(m.recent(10)) == 3
+    # persisted with the project, and a legacy line without one loads as shared
+    assert {i.project for i in MemoryStore(tmp_path / "m.jsonl").recent(10)} == {"garden", "mcp", ""}

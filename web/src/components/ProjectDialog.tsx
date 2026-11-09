@@ -1,7 +1,8 @@
-import { Archive, ArchiveRestore, FolderPlus, Sparkles } from "lucide-react";
+import { Archive, ArchiveRestore, FolderOpen, FolderPlus, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api, type Project } from "../lib/api";
 import { useStore } from "../lib/store";
+import { FolderPicker } from "./FolderPicker";
 import { act, Busy, ConfirmButton, Field, Modal, toast } from "./ui";
 
 const COLORS = ["#ef3340", "#9f1020", "#f97316", "#f59e0b", "#ec4899", "#a855f7", "#6366f1", "#3b82f6", "#06b6d4", "#10b981", "#84cc16"];
@@ -18,6 +19,7 @@ export function ProjectDialog({ open, onClose, project }: { open: boolean; onClo
   const [naming, setNaming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [picking, setPicking] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -84,8 +86,12 @@ export function ProjectDialog({ open, onClose, project }: { open: boolean; onClo
         <button onClick={save} disabled={!path.trim() || saving} className="btn-primary"><Busy on={saving}>{editing ? "Save" : "Create project"}</Busy></button>
       </>}>
       <Field label="Folder" hint="The agent's file tools, shell and sandbox are confined to this directory.">
+        <div className="flex gap-2">
         <input className="input font-mono text-[13px]" value={path} onChange={(e) => setPath(e.target.value)} onBlur={() => !editing && !name && suggest()}
           placeholder="~/code/my-app" autoFocus={!editing} />
+          <button className="btn-outline shrink-0" onClick={() => setPicking(true)}><FolderOpen size={14} /> Browse</button>
+        </div>
+        <FolderPicker open={picking} start={path.trim() || undefined} onClose={() => setPicking(false)} onPick={(p) => { setPath(p); setPicking(false); if (!editing && !name) setNaming(false); }} />
       </Field>
       {!editing && (
         <label className="flex items-center gap-2 text-[13px] text-muted">

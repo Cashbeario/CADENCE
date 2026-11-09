@@ -1,6 +1,6 @@
 import clsx from "clsx";
 import { Bot, Download, Eye, FilePlus2, History, NotebookPen, PencilLine, RotateCcw, Save, User } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type CanvasDoc, type CanvasSummary } from "../lib/api";
 import { useLive, useStore } from "../lib/store";
 import { Markdown } from "./Messages";
@@ -19,6 +19,7 @@ export function CanvasPanel() {
   const [history, setHistory] = useState(false);
   const [exporting, setExporting] = useState(false);
   const selected = store.dock.canvasId;
+  const scroller = useRef<HTMLDivElement>(null);
   const dirty = !!doc && draft !== doc.content;
 
   const loadList = useCallback(() => api.canvas(pid).then(setDocs).catch(() => undefined), [pid]);
@@ -45,10 +46,17 @@ export function CanvasPanel() {
       setDoc(null);
       store.setDock({ canvasId: null });
     } else if (m.kind === "canvas" && id === doc?.id && (m.doc as CanvasSummary).author === "agent") {
-      if (dirty) setIncoming(true);
+      if (m.streaming) {  // the agent is still writing: show the text as it arrives
+        setDoc({ ...doc, title: (m.doc as CanvasSummary).title, content: String(m.content) });
+        if (!dirty) setDraft(String(m.content));
+      } else if (dirty) setIncoming(true);
       else void open(id);
     }
   });
+
+  useEffect(() => {  // follow the text while the agent writes
+    if (doc?.streaming && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
+  }, [draft, doc?.streaming]);
 
   const save = async () => {
     if (!doc || !dirty) return;
@@ -107,7 +115,7 @@ export function CanvasPanel() {
         <select value={doc.format} onChange={(e) => meta({ format: e.target.value })} className="bg-transparent text-[11.5px] outline-none">
           {FORMATS.map((f) => <option key={f} value={f}>{f}</option>)}
         </select>
-        <span className="flex items-center gap-1">{doc.author === "agent" ? <Bot size={12} /> : <User size={12} />}{ago(doc.updated)}</span>
+        <span className="flex items-center gap-1">{doc.author === "agent" ? <Bot size={12} /> : <User size={12} />}{doc.streaming ? "writing…" : ago(doc.updated)}</span>
         {doc.versions.length > 0 && (
           <button onClick={() => setHistory(true)} className="flex items-center gap-1 hover:text-ink"><History size={12} />{doc.versions.length}</button>
         )}
@@ -121,7 +129,7 @@ export function CanvasPanel() {
           <button onClick={() => setIncoming(false)} className="underline">Keep mine</button>
         </div>
       )}
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div ref={scroller} className="min-h-0 flex-1 overflow-auto">
         {mode === "edit" ? (
           <CodeEditor value={draft} onChange={setDraft} onSave={save} className="h-full rounded-none border-0" minRows={30} />
         ) : doc.format === "html" ? (

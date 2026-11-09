@@ -9,6 +9,9 @@ Events and their payloads (all also carry `event`, `workspace`, `agent`):
     stop           {text}                               agent finished a turn
     task_done      {task_id, goal_id, title, status, result}   a task reached a terminal status ("goal_done" is an alias)
     goal_achieved  {goal_id, title, assessment}         the planner judged a long-horizon goal achieved
+    goal_planned   {goal_id, title, progress, assessment, queued}   the planner evaluated a goal and queued its next tasks
+    heartbeat      {cycle, ideas, lessons}              an idle daemon cycle finished (ideas brainstormed, lessons consolidated)
+    reflection     {project, memories, ideas}           a reflection pass filed memories and ideas
 
 Shell protocol (mirrors Claude Code): the payload is JSON on stdin.
   exit 0 → stdout, if any, is added as context (user_prompt: appended to the prompt;
@@ -35,7 +38,8 @@ from .config import HookConfig
 
 log = logging.getLogger(__name__)
 
-EVENTS = ("session_start", "user_prompt", "pre_tool", "post_tool", "stop", "task_done", "goal_achieved")
+EVENTS = ("session_start", "user_prompt", "pre_tool", "post_tool", "stop", "task_done", "goal_achieved",
+          "goal_planned", "heartbeat", "reflection")
 ALIASES = {"goal_done": "task_done"}  # ≤0.2 name
 MATCHED = ("pre_tool", "post_tool")
 

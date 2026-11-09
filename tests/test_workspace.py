@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -15,6 +16,7 @@ from cadence.llm import Completion
 from cadence.memory import MemoryStore
 from cadence.projects import ProjectError, check_path, suggest_name
 from cadence.runtime import Runtime
+from cadence.tasks import Task
 from cadence.web.server import build_app
 
 ORIGIN = {"Origin": "http://127.0.0.1"}
@@ -372,3 +374,133 @@ async def test_agent_browser_snapshot_click_and_type(cfg):
         assert frame and len(frame["data"]) > 100
     finally:
         await mgr.close()
+
+
+async def test_canvas_document_streams_while_the_model_writes_it(cfg, make_router):
+    from conftest import ScriptedLLM
+    from cadence.llm import ModelRouter, StreamDelta, ToolCall
+
+    full = json.dumps({"title": "Spec", "format": "markdown", "content": "# Spec\n\nline one\nline two"})
+
+    class Streaming(ScriptedLLM):
+        async def complete(self, messages, tools=None, *, on_delta=None, **kw):
+            if on_delta and not self.script:
+                self.script.append(Completion(content="done"))
+            if on_delta and not self.calls:
+                for i in range(0, len(full), 9):
+                    await on_delta(StreamDelta("tool_args", full[i:i + 9], "c1", "canvas_write"))
+                self.calls.append([])
+                return Completion(tool_calls=[ToolCall(id="c1", name="canvas_write", arguments=full)])
+            return await super().complete(messages, tools, on_delta=on_delta, **kw)
+
+    router = ModelRouter(Streaming("big"), ScriptedLLM("small"))
+    rt, client = await _client(cfg, router)
+    try:
+        sid = (await (await client.post("/api/sessions", headers=ORIGIN)).json())["id"]
+        ws = await client.ws_connect("/api/ws", headers=ORIGIN)
+        await ws.send_json({"op": "send", "session": sid, "text": "write a spec"})
+        events = []
+        async with asyncio.timeout(10):
+            async for msg in ws:
+                m = msg.json()
+                events.append(m)
+                if m["kind"] == "turn" and m["state"] == "finished":
+                    break
+        canvas = [m for m in events if m["kind"] == "canvas"]
+        streamed = [m for m in canvas if m.get("streaming")]
+        assert streamed and streamed[0]["focus"], "the canvas should open as soon as the model starts writing"
+        assert streamed[0]["doc"]["title"] == "Spec" and full.startswith('{"title": "Spec"')
+        docs = rt.canvas.list()
+        assert len(docs) == 1 and docs[0].content.endswith("line two") and not docs[0].streaming  # claimed, not duplicated
+        await ws.close()
+    finally:
+        await client.close()
+        await rt.close()
+
+
+def test_partial_args_reads_a_cut_off_tool_call():
+    from cadence.canvas import partial_args
+    raw = '{"title": "A \\"b\\"", "content": "x\\ny \\u00e9 and'
+    assert partial_args(raw) == {"title": 'A "b"', "content": "x\ny é and"}
+
+
+async def test_reflection_files_memories_and_goal_ideas(cfg, make_router):
+    from cadence.reflect import reflect
+    from cadence.ideas import IdeaStore
+    from cadence.memory import MemoryStore
+    from cadence.tasks import TaskStore
+    reply = json.dumps({"memories": [{"kind": "procedural", "text": "Run pytest with PYTHONPATH=src"}],
+                        "ideas": [{"title": "Add a CI workflow", "size": "goal"}]})
+    router = make_router(small_script=[Completion(content=reply)])
+    mem, ideas, tasks = MemoryStore(cfg.state_dir / "m.jsonl"), IdeaStore(cfg.state_dir / "i.json"), TaskStore(cfg.state_dir / "t.json")
+    done = await reflect(router, mem, ideas, tasks, project="p", log_text="USER: fix the tests\n" * 10)
+    assert done == {"memories": 1, "ideas": 1}
+    assert mem.recent(5)[0].text.startswith("Run pytest") and ideas.list(project="p")[0].size == "goal"
+
+
+async def test_reflection_files_all_three_memory_kinds(cfg, make_router):
+    from cadence.reflect import reflect
+    from cadence.ideas import IdeaStore
+    from cadence.memory import MemoryStore
+    from cadence.tasks import TaskStore
+    reply = json.dumps({"summary": "Fixed the failing parser tests.", "facts": ["The user prefers pytest over unittest"],
+                        "lessons": ["Run pytest with PYTHONPATH=src"], "ideas": []})
+    router = make_router(small_script=[Completion(content=reply)])
+    mem = MemoryStore(cfg.state_dir / "m.jsonl")
+    done = await reflect(router, mem, IdeaStore(cfg.state_dir / "i.json"), TaskStore(cfg.state_dir / "t.json"),
+                         project="p", log_text="USER: fix the tests\n" * 10)
+    assert done["memories"] == 3
+    assert {m.kind for m in mem.recent(5)} == {"episodic", "semantic", "procedural"}
+
+
+def test_near_duplicate_memories_are_folded(cfg):
+    from cadence.memory import MemoryStore
+    mem = MemoryStore(cfg.state_dir / "m.jsonl")
+    a = mem.add("procedural", "Always run the full test suite before reporting a task as done")
+    b = mem.add("procedural", "Always run the full test suite before reporting the task as done.")
+    assert a.id == b.id and len(mem) == 1
+    mem.add("semantic", "Always run the full test suite before reporting a task as done")  # other kind: kept
+    assert len(mem) == 2
+    mem._items.append(type(a)(kind="procedural", text="Always run the whole test suite before reporting a task as done"))
+    assert mem.dedupe() == 1 and len(mem) == 2
+
+
+async def test_planner_sets_priority_due_and_always_leaves_a_next_task(cfg, make_router):
+    router = make_router(big_script=[
+        Completion(content=json.dumps({"assessment": "starting", "progress": 5, "status": "working",
+                                       "tasks": [{"title": "Draft the schema", "priority": 5, "estimate_min": 20}]})),
+        plan(10, tasks=()),  # working but proposes nothing, and nothing is queued: a fallback task is made
+    ])
+    rt = await Runtime(cfg, router=router, memory=MemoryStore(cfg.state_dir / "m.jsonl")).start()
+    goal = rt.goals.add(Goal(title="Ship billing", priority=4))
+    added = await rt.planner.plan(goal, cfg.workspace)
+    assert added[0].priority == 5 and added[0].estimate_min == 20 and added[0].due > time.time()
+    assert rt.goals.get(goal.id).next_review > time.time()  # the goal will be evaluated again on schedule
+    rt.tasks.update(added[0], status="done")
+    again = await rt.planner.plan(goal, cfg.workspace)
+    assert len(again) == 1 and again[0].priority == 4 and again[0].estimate_min == 30
+    await rt.close()
+
+
+async def test_daemon_runs_user_and_high_priority_work_first(cfg, make_router):
+    rt = await Runtime(cfg, router=make_router(), memory=MemoryStore(cfg.state_dir / "m.jsonl")).start()
+    d = rt.make_daemon()
+    low = rt.tasks.add(Task(title="low", priority=1, source="planner"))
+    high = rt.tasks.add(Task(title="high", priority=5, source="planner"))
+    user = rt.tasks.add(Task(title="user", priority=3, source="user"))
+    order = sorted([low, high, user], key=d._weight, reverse=True)
+    assert [t.title for t in order] == ["user", "high", "low"]
+    await rt.close()
+
+
+def test_system_prompt_sections_are_trimmed_lowest_weight_first():
+    from cadence.agent import fit_by_weight
+    out = fit_by_weight([(10, "CORE" * 50), (4, "SKILLS" * 400), (6, "MEMORY" * 100)], budget=1000)
+    assert out.count("CORE") == 50 and "MEMORY" in out and len(out) <= 1100
+    assert out.count("SKILLS") < 400  # the lowest-weight section took the cut
+
+
+def test_reasoning_headroom_is_added_to_short_structured_calls(cfg):
+    from cadence.llm import OpenAICompatLLM
+    llm = OpenAICompatLLM(cfg.big)
+    assert cfg.big.reasoning_headroom > 0 and llm.cfg is cfg.big
